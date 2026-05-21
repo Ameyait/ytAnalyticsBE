@@ -7,7 +7,9 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel
 import asyncio
 from zoneinfo import ZoneInfo
-
+from sqlalchemy import select, desc
+from models import ScrapeLog
+from datetime import timezone
 from database import get_db, init_db, AsyncSessionLocal
 from crud import VideoCRUD, ScrapeLogCRUD
 from scraper_service import ScraperService
@@ -152,13 +154,9 @@ app.add_middleware(
 async def get_videos(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=500),
-    # Category filter - NOW SUPPORTS ALL 7 CATEGORIES
-    category: Optional[str] = Query(
-        None, 
-        description="Filter by category: 'rhymes', 'stories', 'cartoon', 'animation', 'birds', 'bedtime', 'moral'"
-    ),
+    category: Optional[str] = Query(None, description="Filter by category"),
     search: Optional[str] = Query(None, description="Search in title and channel"),
-    sort_by: str = Query("views", description="Sort field: views, likes, comments, published_at, duration_seconds"),
+    sort_by: str = Query("views", description="Sort field"),
     sort_order: str = Query("desc", description="Sort order: asc or desc"),
     min_views: Optional[int] = Query(None, ge=0),
     max_views: Optional[int] = Query(None, ge=0),
@@ -168,25 +166,6 @@ async def get_videos(
     channel: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    GET VIDEOS WITH FILTERS
-    
-    Available categories:
-    - rhymes: Telugu rhymes and kids songs
-    - stories: Telugu kids stories
-    - cartoon: Telugu cartoons
-    - animation: Telugu animated content (NEW!)
-    - birds: Birds and animal stories
-    - bedtime: Bedtime stories
-    - moral: Moral stories (Neethi Kathalu)
-    
-    Examples:
-    - Get all animations: /videos?category=animation
-    - Get all cartoons: /videos?category=cartoon
-    - Get top 10 animations: /videos?category=animation&limit=10&sort_by=views
-    - Search animations: /videos?category=animation&search=elephant
-    """
-    
     # Validate category
     allowed_categories = ["rhymes", "stories", "cartoon", "animation", "birds", "bedtime", "moral"]
     if category and category not in allowed_categories:
@@ -203,8 +182,35 @@ async def get_videos(
         hours_ago_max=hours_ago_max, channel=channel
     )
     
+    # Get last successful scrape with IST timezone
+    
+    
+    result = await db.execute(
+        select(ScrapeLog)
+        .where(ScrapeLog.status == "completed")
+        .order_by(desc(ScrapeLog.completed_at))
+        .limit(1)
+    )
+    last_scrape = result.scalar_one_or_none()
+    
+    last_scrape_info = None
+    if last_scrape and last_scrape.completed_at:
+        # Convert UTC to IST
+        ist_timezone = ZoneInfo("Asia/Kolkata")
+        completed_ist = last_scrape.completed_at.replace(tzinfo=timezone.utc).astimezone(ist_timezone)
+        
+        last_scrape_info = {
+            "last_scrape_ist": completed_ist.strftime("%Y-%m-%d %I:%M:%S %p"),
+            "last_scrape_date": completed_ist.strftime("%Y-%m-%d"),
+            "last_scrape_time": completed_ist.strftime("%I:%M:%S %p"),
+            "last_scrape_full": completed_ist.strftime("%d %B %Y at %I:%M:%S %p IST"),
+            "total_videos_saved": last_scrape.total_saved,
+            "source": last_scrape.source
+        }
+    
     return VideosResponse(
-        success=True, total=total,
+        success=True, 
+        total=total,
         filters_applied={
             "page": page, 
             "limit": limit, 
@@ -213,7 +219,8 @@ async def get_videos(
             "sort_by": sort_by,
             "sort_order": sort_order
         },
-        videos=[VideoResponse.model_validate(v) for v in videos]
+        videos=[VideoResponse.model_validate(v) for v in videos],
+        last_scrape_info=last_scrape_info  # Add this to your response model
     )
 
 
