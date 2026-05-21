@@ -138,12 +138,12 @@ class YouTubeService:
                     relevanceLanguage="te",
                     safeSearch="strict",
                     publishedAfter=published_after,
-                    videoDuration="any",  # OPTIMIZED: single search instead of two
+                    videoDuration="any",
                 ).execute()
             )
             ids = [item["id"]["videoId"] for item in response.get("items", [])]
             video_ids.extend(ids)
-            self.quota_used += 100  # 100 quota per search (was 200 before)
+            self.quota_used += 100
         except HttpError as e:
             print(f"    ⚠️  Error '{keyword}': {e}")
         
@@ -155,6 +155,9 @@ class YouTubeService:
         
         youtube = self._get_client()
         videos_data = []
+        
+        # Also fetch channel details to get channel URLs
+        channel_ids = set()
         
         for i in range(0, len(video_ids), 50):
             batch_ids = video_ids[i:i+50]
@@ -170,6 +173,10 @@ class YouTubeService:
                 
                 for item in response.get("items", []):
                     snippet = item["snippet"]
+                    channel_id = snippet.get("channelId", "")
+                    if channel_id:
+                        channel_ids.add(channel_id)
+                    
                     stats = item.get("statistics", {})
                     content = item.get("contentDetails", {})
                     
@@ -199,10 +206,12 @@ class YouTubeService:
                     
                     group = self._determine_group(title, channel)
                     
+                    # Store video data with channel_id for later URL construction
                     video_data = {
                         "video_id": item["id"],
                         "title": title,
                         "channel": channel,
+                        "channel_id": channel_id,  # Store channel ID
                         "views": int(stats.get("viewCount", 0)),
                         "likes": int(stats.get("likeCount", 0)),
                         "comments": int(stats.get("commentCount", 0)),
@@ -212,6 +221,7 @@ class YouTubeService:
                         "published_at": published_at,
                         "hours_ago": hours_ago,
                         "url": f"https://www.youtube.com/watch?v={item['id']}",
+                        "channel_url": f"https://www.youtube.com/channel/{channel_id}",  # Channel URL
                         "thumbnail_url": snippet.get("thumbnails", {}).get("high", {}).get("url", ""),
                         "group_category": group,
                         "matched_keywords": [],

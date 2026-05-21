@@ -1,3 +1,4 @@
+# schemas.py
 from pydantic import BaseModel
 from datetime import datetime
 from typing import Optional, List
@@ -8,7 +9,7 @@ class VideoCategoryEnum(str, Enum):
     RHYMES = "rhymes"
     STORIES = "stories"
     CARTOON = "cartoon"
-    ANIMATION = "animation"  # NEW: Separate animation category
+    ANIMATION = "animation"
     BIRDS = "birds"
     BEDTIME = "bedtime"
     MORAL = "moral"
@@ -18,6 +19,8 @@ class VideoBase(BaseModel):
     video_id: str
     title: str
     channel: str
+    channel_id: Optional[str] = None  # ADD THIS
+    channel_url: Optional[str] = None  # ADD THIS
     views: int
     likes: int
     comments: int

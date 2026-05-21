@@ -1,3 +1,4 @@
+# models.py - Add channel_url column
 from sqlalchemy import Column, String, Integer, BigInteger, DateTime, Text, Index
 from sqlalchemy.dialects.mysql import JSON
 from datetime import datetime
@@ -12,6 +13,8 @@ class Video(Base):
     video_id = Column(String(50), unique=True, nullable=False, index=True)
     title = Column(Text, nullable=False)
     channel = Column(String(255), nullable=False)
+    channel_id = Column(String(100), nullable=True)  # ADD THIS - YouTube channel ID
+    channel_url = Column(String(500), nullable=True)  # ADD THIS - YouTube channel URL
     views = Column(BigInteger, default=0)
     likes = Column(BigInteger, default=0)
     comments = Column(BigInteger, default=0)
@@ -23,7 +26,7 @@ class Video(Base):
     hours_ago = Column(Integer)
     url = Column(String(255))
     thumbnail_url = Column(String(500))
-    group_category = Column(String(50), nullable=False)  # Will store: rhymes, stories, cartoon, animation, birds, bedtime, moral
+    group_category = Column(String(50), nullable=False)
     
     # SEO fields
     matched_keywords = Column(JSON, default=list)

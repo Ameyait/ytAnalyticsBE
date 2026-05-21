@@ -82,6 +82,8 @@ class VideoResponse(BaseModel):
     video_id: str
     title: str
     channel: str
+    channel_id: Optional[str] = None  # ADD THIS
+    channel_url: Optional[str] = None  # ADD THIS - YouTube channel link
     views: int
     likes: int
     comments: int
@@ -104,7 +106,7 @@ class VideosResponse(BaseModel):
     total: int
     filters_applied: dict
     videos: List[VideoResponse]
-    last_refreshed: Optional[str] = None 
+    last_refreshed: Optional[str] = None
 
 
 class ScrapeResponse(BaseModel):
@@ -148,7 +150,7 @@ app.add_middleware(
 
 
 # =============================================================
-# UPDATED GET VIDEOS ENDPOINT WITH ALL CATEGORIES
+# UPDATED GET VIDEOS ENDPOINT WITH CHANNEL URL
 # =============================================================
 
 @app.get("/videos", response_model=VideosResponse)
@@ -194,10 +196,8 @@ async def get_videos(
     
     last_refreshed = None
     if last_scrape and last_scrape.completed_at:
-        # Convert UTC to IST
         ist_timezone = ZoneInfo("Asia/Kolkata")
         completed_ist = last_scrape.completed_at.replace(tzinfo=timezone.utc).astimezone(ist_timezone)
-        # Format: "15 January 2024 at 11:05:30 AM IST"
         last_refreshed = completed_ist.strftime("%d %B %Y at %I:%M:%S %p IST")
     
     return VideosResponse(
@@ -212,14 +212,9 @@ async def get_videos(
             "sort_order": sort_order
         },
         videos=[VideoResponse.model_validate(v) for v in videos],
-        last_refreshed=last_refreshed  # Add the last refreshed date
+        last_refreshed=last_refreshed
     )
 
-
-
-# =============================================================
-# NEW: Category Stats Endpoint
-# =============================================================
 
 @app.get("/categories/stats")
 async def get_category_stats(db: AsyncSession = Depends(get_db)):
@@ -240,10 +235,6 @@ async def get_category_stats(db: AsyncSession = Depends(get_db)):
         "total": sum(stats.values())
     }
 
-
-# =============================================================
-# NEW: Get Animation Videos Only (Convenience Endpoint)
-# =============================================================
 
 @app.get("/animations", response_model=VideosResponse)
 async def get_animations(
@@ -267,10 +258,6 @@ async def get_animations(
         videos=[VideoResponse.model_validate(v) for v in videos]
     )
 
-
-# =============================================================
-# NEW: Get Cartoon Videos Only (Convenience Endpoint)
-# =============================================================
 
 @app.get("/cartoons", response_model=VideosResponse)
 async def get_cartoons(
@@ -297,8 +284,16 @@ async def get_cartoons(
 
 @app.post("/scrape", response_model=ScrapeResponse)
 async def trigger_scrape(background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
-    scrape_log = await ScrapeLogCRUD.create_log(db)
+    from models import ScrapeLog as ScrapeLogModel
+    
+    scrape_log = ScrapeLogModel(
+        status="running",
+        total_videos_found=0,
+        total_videos_saved=0
+    )
+    db.add(scrape_log)
     await db.commit()
+    await db.refresh(scrape_log)
     
     async def run_scrape():
         async with AsyncSessionLocal() as new_session:
@@ -306,14 +301,29 @@ async def trigger_scrape(background_tasks: BackgroundTasks, db: AsyncSession = D
                 videos, stats = await scraper_service.scrape_all_videos()
                 saved_videos = await VideoCRUD.bulk_create_or_update(new_session, videos)
                 deleted_count = await VideoCRUD.delete_old_videos(new_session, days=3)
-                await ScrapeLogCRUD.update_log(new_session, scrape_log.id, 
-                    total_found=stats["total_videos_found"], total_saved=len(saved_videos), status="completed")
-                await new_session.commit()
+                
+                result = await new_session.execute(
+                    select(ScrapeLogModel).where(ScrapeLogModel.id == scrape_log.id)
+                )
+                log = result.scalar_one_or_none()
+                if log:
+                    log.completed_at = datetime.utcnow()
+                    log.total_videos_found = stats["total_videos_found"]
+                    log.total_videos_saved = len(saved_videos)
+                    log.status = "completed"
+                    await new_session.commit()
+                
                 print(f"✅ Manual scrape completed: {len(saved_videos)} videos saved, {deleted_count} deleted")
             except Exception as e:
                 print(f"❌ Manual scrape failed: {e}")
-                await ScrapeLogCRUD.update_log(new_session, scrape_log.id, status="failed", error_message=str(e))
-                await new_session.commit()
+                result = await new_session.execute(
+                    select(ScrapeLogModel).where(ScrapeLogModel.id == scrape_log.id)
+                )
+                log = result.scalar_one_or_none()
+                if log:
+                    log.status = "failed"
+                    log.error_message = str(e)
+                    await new_session.commit()
     
     background_tasks.add_task(run_scrape)
     return ScrapeResponse(success=True, message="Scraping started", scrape_id=scrape_log.id)
@@ -331,7 +341,25 @@ async def cleanup_old_videos(days: int = Query(3, ge=1, le=30), db: AsyncSession
 async def get_stats(db: AsyncSession = Depends(get_db)):
     from sqlalchemy import select, func
     total_result = await db.execute(select(func.count()).select_from(Video))
-    return {"total_videos": total_result.scalar() or 0}
+    
+    result = await db.execute(
+        select(ScrapeLog)
+        .where(ScrapeLog.status == "completed")
+        .order_by(desc(ScrapeLog.completed_at))
+        .limit(1)
+    )
+    last_scrape = result.scalar_one_or_none()
+    
+    last_refreshed = None
+    if last_scrape and last_scrape.completed_at:
+        ist_timezone = ZoneInfo("Asia/Kolkata")
+        completed_ist = last_scrape.completed_at.replace(tzinfo=timezone.utc).astimezone(ist_timezone)
+        last_refreshed = completed_ist.strftime("%d %B %Y at %I:%M:%S %p IST")
+    
+    return {
+        "total_videos": total_result.scalar() or 0,
+        "last_refreshed": last_refreshed
+    }
 
 
 @app.get("/")
@@ -341,13 +369,13 @@ async def root():
         "version": "1.0.0",
         "categories": ["rhymes", "stories", "cartoon", "animation", "birds", "bedtime", "moral"],
         "endpoints": {
-            "GET /videos": "Get videos with category filter",
+            "GET /videos": "Get videos with category filter (includes channel URL and last refreshed date)",
             "GET /animations": "Get only animation videos",
             "GET /cartoons": "Get only cartoon videos",
             "GET /categories/stats": "Get category statistics",
             "POST /scrape": "Trigger manual scrape",
             "POST /cleanup": "Delete old videos",
-            "GET /stats": "Get basic statistics"
+            "GET /stats": "Get basic statistics with last refreshed date"
         }
     }
 
