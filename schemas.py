@@ -8,6 +8,7 @@ class VideoCategoryEnum(str, Enum):
     RHYMES = "rhymes"
     STORIES = "stories"
     CARTOON = "cartoon"
+    ANIMATION = "animation"  # NEW: Separate animation category
     BIRDS = "birds"
     BEDTIME = "bedtime"
     MORAL = "moral"

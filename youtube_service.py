@@ -16,120 +16,62 @@ class YouTubeService:
         self.quota_limit = 10000
         
         # =============================================================
-        # FULL KEYWORD GROUPS - MATCHING STANDALONE SCRIPT
+        # OPTIMIZED: Only 5-10 BROAD keywords (as per recommendation)
         # =============================================================
         
-        self.GROUP_RHYMES = [
-            "Telugu rhymes",
-            "Kids rhymes Telugu",
-            "Telugu Nursery Rhymes",
-            "Telugu Nursery Rhymes For Kids",
-            "Kids songs Telugu",
-            "Telugu kids rhymes",
-            "Nursery rhymes Telugu",
+        # Broad keywords for Moral Stories
+        self.KEYWORDS_MORAL = [
+            "Telugu moral stories",
+            "Telugu neethi kathalu",
+            "Telugu panchatantra stories",
         ]
         
-        self.GROUP_STORIES = [
-            "kids story telugu",
-            "Kids storys Telugu",
-            "Telugu kids storys",
-            "new telugu storys",
-            "new telugu kathalu",
-            "storys in telugu",
-            "stories in telugu",
-            "children storys Telugu",
-            "telugu children storys",
+        # Broad keywords for Birds Stories
+        self.KEYWORDS_BIRDS = [
+            "Telugu birds stories",
+            "Telugu chilaka kathalu",
+            "Telugu pichuka kathalu",
         ]
         
-        self.GROUP_CARTOON = [
-            "Telugu cartoon",
-            "telugu cartoons",
-        ]
-        
-        self.GROUP_BIRDS = [
-            "Birds Stories Telugu",
-            "Birds stories telugu",
-            "Chilaka stories Telugu",
-            "Pichuka stories Telugu",
-            "Pavuram stories Telugu",
-            "Kaki stories Telugu",
-            "Chilaka Kathalu",
-            "Pichuka Kathalu",
-            "Pavuram Kathalu",
-            "Kaki Kathalu",
-        ]
-        
-        self.GROUP_BEDTIME = [
-            "Bedtime stories Telugu",
-            "Bedtime stories kids Telugu",
-        ]
-        
-        self.GROUP_MORAL = [
-            "Neethi Kathalu Telugu",
-            "Elephant stories Telugu",
-        ]
-        
-        self.ALL_KEYWORD_GROUPS = {
-            "rhymes": self.GROUP_RHYMES,
-            "stories": self.GROUP_STORIES,
-            "cartoon": self.GROUP_CARTOON,
-            "birds": self.GROUP_BIRDS,
-            "bedtime": self.GROUP_BEDTIME,
-            "moral": self.GROUP_MORAL,
-        }
+        # ALL keywords - only 6 total (fits 5-10 recommendation)
+        self.ALL_KEYWORDS = self.KEYWORDS_MORAL + self.KEYWORDS_BIRDS
         
         # =============================================================
-        # FULL CONTENT FILTERS - MATCHING STANDALONE SCRIPT
+        # CONTENT FILTERS (maintained for quality)
         # =============================================================
         
         self.MUST_CONTAIN_ANY = [
             # Telugu story words
-            "story","stories","kathalu","kathali","katha","katalu",
-            # Rhymes / songs for kids
-            "rhymes","rhyme","nursery","lullaby","balaganapam",
-            # Animation / cartoon
-            "cartoon","cartoons","animation","animated","toons",
-            # Moral / bedtime
-            "moral","neethi","neeti","bedtime","fairy","tales","tale",
+            "story", "stories", "kathalu", "katha",
+            # Moral stories
+            "moral", "neethi", "neeti", "panchatantra", "hitopadesha",
             # Bird characters
-            "chilaka","pichuka","pavuram","kaki","tuni","bujji",
-            # Animals
-            "elephant","enaugu","పిచుక","చిలక","పావురం","కాకి","ఏనుగు",
-            # Kids / children
-            "kids","children","child","baby","balalu","బాలలు",
-            # Telugu script story words
-            "కథలు","కథ","నీతి","కార్టూన్",
-            # Panchatantra / classic
-            "panchatantra","hitopadesha","atha","kodalu",
-            # Song for kids
-            "song","songs","గేయాలు",
+            "chilaka", "pichuka", "pavuram", "kaki", "tuni",
+            # Telugu script
+            "కథలు", "కథ", "నీతి",
+            # Kids content
+            "kids", "children", "child", "బాలలు",
         ]
         
         self.MUST_NOT_CONTAIN = [
-            # Trailers / movies
-            "trailer","teaser","movie","film","cinema","theatre",
-            "review","reaction","interview","press meet",
-            # Music (adult)
-            "remix","dj","bhajan","rap","gaana","album","audio",
-            "lyrical video","lyric video","full video song",
-            # Gaming
-            "gaming","gameplay","gta","minecraft","freefire","free fire",
-            "bgmi","pubg","roblox","fortnite","among us",
-            # News / politics
-            "news","breaking","live news","election","vote","government",
-            "parliament","budget","politics","update","latest news",
-            # Sports
-            "cricket","ipl","match","highlights","football","kabaddi",
-            # Adult / regional films
-            "bollywood","bigg boss","web series","serial","natak",
-            "bhojpuri","punjabi","haryanvi","marathi film","kannada movie",
-            # Tech / other
-            "unboxing","vlog","prank","challenge","hack","tutorial",
-            # Adult content signals
-            "adult","18+","hot","sexy","romance","couple","husband","wife",
+            "trailer", "teaser", "movie", "film", "cinema", "theatre",
+            "review", "reaction", "interview", "press meet",
+            "remix", "dj", "bhajan", "rap", "gaana", "album", "audio",
+            "lyrical video", "lyric video", "full video song",
+            "gaming", "gameplay", "gta", "minecraft", "freefire",
+            "news", "breaking", "live news", "election", "government",
+            "cricket", "ipl", "match", "highlights", "football",
+            "bollywood", "bigg boss", "web series", "serial",
+            "unboxing", "vlog", "prank", "challenge", "hack", "tutorial",
+            "adult", "18+", "hot", "sexy", "romance", "couple",
+            # Exclude rhymes, cartoons, animations as requested
+            "rhyme", "nursery", "lullaby", "balaganapam", "song",
+            "cartoon", "toons", "animation", "animated", "anime",
+            "bedtime", "fairy", "tale", "night",
         ]
         
-        self.ALLOWED_CATEGORIES = {"1", "22", "24", "27", "15"}
+        self.ALLOWED_CATEGORIES = {"1", "22", "23", "24", "27", "15"}
+        # 1=Film&Animation, 23=Comedy, 24=Entertainment, 27=Education, 15=Pets&Animals, 22=People&Blogs
         
         self.CATEGORY_MAP = {
             "1": "Film & Animation", "2": "Autos & Vehicles", "10": "Music",
@@ -159,55 +101,51 @@ class YouTubeService:
         return f"{seconds}s", total
     
     def _determine_group(self, title: str, channel: str) -> str:
+        """Determine if video is Moral or Birds story"""
         combined = f"{title.lower()} {channel.lower()}"
         
-        # Check each group (matching standalone script logic)
-        if any(kw in combined for kw in ["rhyme", "nursery", "lullaby", "balaganapam", "song", "songs", "గేయాలు"]):
-            return "rhymes"
+        # Check for Birds first
+        bird_keywords = [
+            "bird", "birds", "chilaka", "pichuka", "pavuram", "kaki", 
+            "tuni", "parrot", "sparrow", "crow", "dove", "peacock"
+        ]
         
-        if any(kw in combined for kw in ["bedtime", "fairy", "tale", "night"]):
-            return "bedtime"
-        
-        if any(kw in combined for kw in ["moral", "neethi", "neeti", "panchatantra", "hitopadesha"]):
-            return "moral"
-        
-        if any(kw in combined for kw in ["bird", "chilaka", "pichuka", "pavuram", "kaki", "animal", "elephant", "lion", "monkey", "rabbit", "turtle", "fox", "deer", "tiger", "bear", "horse", "panchatantra", "జంతువుల"]):
+        if any(kw in combined for kw in bird_keywords):
             return "birds"
         
-        if any(kw in combined for kw in ["cartoon", "animation", "animated", "toons", "anime", "2d", "3d"]):
-            return "cartoon"
-        
-        return "stories"
+        # Default to Moral stories
+        return "moral"
     
     async def search_keyword(self, keyword: str, published_after: str) -> List[str]:
-        """Search BOTH medium AND long videos - matching standalone script"""
+        """
+        OPTIMIZED: Search with videoDuration="any" instead of separate medium/long
+        This reduces quota from 200 to 100 per keyword (50% savings)
+        """
         youtube = self._get_client()
         video_ids = []
         
-        # Search both "medium" AND "long" (like standalone script)
-        for duration in ["medium", "long"]:
-            try:
-                loop = asyncio.get_event_loop()
-                response = await loop.run_in_executor(
-                    None,
-                    lambda d=duration: youtube.search().list(
-                        part="snippet",
-                        q=keyword,
-                        type="video",
-                        regionCode=config.REGION_CODE,
-                        maxResults=config.MAX_PER_KEYWORD,
-                        order="viewCount",
-                        relevanceLanguage="te",
-                        safeSearch="strict",
-                        publishedAfter=published_after,
-                        videoDuration=d,
-                    ).execute()
-                )
-                ids = [item["id"]["videoId"] for item in response.get("items", [])]
-                video_ids.extend(ids)
-                self.quota_used += 100
-            except HttpError as e:
-                print(f"    ⚠️  Error '{keyword}' [{duration}]: {e}")
+        try:
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: youtube.search().list(
+                    part="snippet",
+                    q=keyword,
+                    type="video",
+                    regionCode=config.REGION_CODE,
+                    maxResults=config.MAX_PER_KEYWORD,
+                    order="viewCount",
+                    relevanceLanguage="te",
+                    safeSearch="strict",
+                    publishedAfter=published_after,
+                    videoDuration="any",  # OPTIMIZED: single search instead of two
+                ).execute()
+            )
+            ids = [item["id"]["videoId"] for item in response.get("items", [])]
+            video_ids.extend(ids)
+            self.quota_used += 100  # 100 quota per search (was 200 before)
+        except HttpError as e:
+            print(f"    ⚠️  Error '{keyword}': {e}")
         
         return list(set(video_ids))
     
@@ -239,7 +177,6 @@ class YouTubeService:
                     channel = snippet.get("channelTitle", "")
                     cat_id = snippet.get("categoryId", "")
                     
-                    # ── STRICT FILTER (matching standalone) ──
                     if cat_id not in self.ALLOWED_CATEGORIES:
                         continue
                     
@@ -251,10 +188,9 @@ class YouTubeService:
                     if not any(good in combined for good in self.MUST_CONTAIN_ANY):
                         continue
                     
-                    # ── DURATION CHECK (matching standalone) ──
                     raw_dur = content.get("duration", "PT0S")
                     _, duration_sec = self._parse_duration(raw_dur)
-                    if duration_sec < config.MIN_DURATION_SECONDS:  # Use < not <=
+                    if duration_sec < config.MIN_DURATION_SECONDS:
                         continue
                     
                     published_str = snippet.get("publishedAt", "")

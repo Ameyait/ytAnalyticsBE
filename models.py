@@ -23,7 +23,7 @@ class Video(Base):
     hours_ago = Column(Integer)
     url = Column(String(255))
     thumbnail_url = Column(String(500))
-    group_category = Column(String(50), nullable=False)  # Using String instead of Enum
+    group_category = Column(String(50), nullable=False)  # Will store: rhymes, stories, cartoon, animation, birds, bedtime, moral
     
     # SEO fields
     matched_keywords = Column(JSON, default=list)

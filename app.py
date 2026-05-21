@@ -133,29 +133,68 @@ app = FastAPI(title="YouTube Telugu Kids Content API", version="1.0.0", lifespan
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://13.127.71.122:3000",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# =============================================================
+# UPDATED GET VIDEOS ENDPOINT WITH ALL CATEGORIES
+# =============================================================
+
 @app.get("/videos", response_model=VideosResponse)
 async def get_videos(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=500),
-    category: Optional[str] = None,
-    search: Optional[str] = None,
-    sort_by: str = "views",
-    sort_order: str = "desc",
-    min_views: Optional[int] = None,
-    max_views: Optional[int] = None,
-    min_duration: Optional[int] = None,
-    max_duration: Optional[int] = None,
-    hours_ago_max: Optional[int] = None,
+    # Category filter - NOW SUPPORTS ALL 7 CATEGORIES
+    category: Optional[str] = Query(
+        None, 
+        description="Filter by category: 'rhymes', 'stories', 'cartoon', 'animation', 'birds', 'bedtime', 'moral'"
+    ),
+    search: Optional[str] = Query(None, description="Search in title and channel"),
+    sort_by: str = Query("views", description="Sort field: views, likes, comments, published_at, duration_seconds"),
+    sort_order: str = Query("desc", description="Sort order: asc or desc"),
+    min_views: Optional[int] = Query(None, ge=0),
+    max_views: Optional[int] = Query(None, ge=0),
+    min_duration: Optional[int] = Query(None, ge=0),
+    max_duration: Optional[int] = Query(None, ge=0),
+    hours_ago_max: Optional[int] = Query(None, ge=0),
     channel: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
+    """
+    GET VIDEOS WITH FILTERS
+    
+    Available categories:
+    - rhymes: Telugu rhymes and kids songs
+    - stories: Telugu kids stories
+    - cartoon: Telugu cartoons
+    - animation: Telugu animated content (NEW!)
+    - birds: Birds and animal stories
+    - bedtime: Bedtime stories
+    - moral: Moral stories (Neethi Kathalu)
+    
+    Examples:
+    - Get all animations: /videos?category=animation
+    - Get all cartoons: /videos?category=cartoon
+    - Get top 10 animations: /videos?category=animation&limit=10&sort_by=views
+    - Search animations: /videos?category=animation&search=elephant
+    """
+    
+    # Validate category
+    allowed_categories = ["rhymes", "stories", "cartoon", "animation", "birds", "bedtime", "moral"]
+    if category and category not in allowed_categories:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Category must be one of: {', '.join(allowed_categories)}"
+        )
+    
     skip = (page - 1) * limit
     videos, total = await VideoCRUD.get_all_videos(
         db, skip=skip, limit=limit, category=category, search=search,
@@ -163,9 +202,95 @@ async def get_videos(
         max_views=max_views, min_duration=min_duration, max_duration=max_duration,
         hours_ago_max=hours_ago_max, channel=channel
     )
+    
     return VideosResponse(
         success=True, total=total,
-        filters_applied={"page": page, "limit": limit, "category": category, "search": search},
+        filters_applied={
+            "page": page, 
+            "limit": limit, 
+            "category": category, 
+            "search": search,
+            "sort_by": sort_by,
+            "sort_order": sort_order
+        },
+        videos=[VideoResponse.model_validate(v) for v in videos]
+    )
+
+
+# =============================================================
+# NEW: Category Stats Endpoint
+# =============================================================
+
+@app.get("/categories/stats")
+async def get_category_stats(db: AsyncSession = Depends(get_db)):
+    """Get video counts by category"""
+    from sqlalchemy import select, func
+    
+    categories = ["rhymes", "stories", "cartoon", "animation", "birds", "bedtime", "moral"]
+    stats = {}
+    
+    for cat in categories:
+        result = await db.execute(
+            select(func.count()).where(Video.group_category == cat)
+        )
+        stats[cat] = result.scalar() or 0
+    
+    return {
+        "categories": stats,
+        "total": sum(stats.values())
+    }
+
+
+# =============================================================
+# NEW: Get Animation Videos Only (Convenience Endpoint)
+# =============================================================
+
+@app.get("/animations", response_model=VideosResponse)
+async def get_animations(
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=500),
+    search: Optional[str] = None,
+    sort_by: str = "views",
+    sort_order: str = "desc",
+    db: AsyncSession = Depends(get_db)
+):
+    """Convenience endpoint to get only animation videos"""
+    skip = (page - 1) * limit
+    videos, total = await VideoCRUD.get_all_videos(
+        db, skip=skip, limit=limit, category="animation", search=search,
+        sort_by=sort_by, sort_order=sort_order
+    )
+    
+    return VideosResponse(
+        success=True, total=total,
+        filters_applied={"category": "animation", "page": page, "limit": limit},
+        videos=[VideoResponse.model_validate(v) for v in videos]
+    )
+
+
+# =============================================================
+# NEW: Get Cartoon Videos Only (Convenience Endpoint)
+# =============================================================
+
+@app.get("/cartoons", response_model=VideosResponse)
+async def get_cartoons(
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=500),
+    search: Optional[str] = None,
+    sort_by: str = "views",
+    sort_order: str = "desc",
+    db: AsyncSession = Depends(get_db)
+):
+    """Convenience endpoint to get only cartoon videos"""
+    skip = (page - 1) * limit
+    videos, total = await VideoCRUD.get_all_videos(
+        db, skip=skip, limit=limit, category="cartoon", search=search,
+        sort_by=sort_by, sort_order=sort_order
+    )
+    
+    return VideosResponse(
+        success=True, total=total,
+        filters_applied={"category": "cartoon", "page": page, "limit": limit},
         videos=[VideoResponse.model_validate(v) for v in videos]
     )
 
@@ -211,7 +336,20 @@ async def get_stats(db: AsyncSession = Depends(get_db)):
 
 @app.get("/")
 async def root():
-    return {"api": "YouTube Telugu Kids Content API", "version": "1.0.0", "endpoints": ["GET /videos", "POST /scrape", "POST /cleanup", "GET /stats"]}
+    return {
+        "api": "YouTube Telugu Kids Content API",
+        "version": "1.0.0",
+        "categories": ["rhymes", "stories", "cartoon", "animation", "birds", "bedtime", "moral"],
+        "endpoints": {
+            "GET /videos": "Get videos with category filter",
+            "GET /animations": "Get only animation videos",
+            "GET /cartoons": "Get only cartoon videos",
+            "GET /categories/stats": "Get category statistics",
+            "POST /scrape": "Trigger manual scrape",
+            "POST /cleanup": "Delete old videos",
+            "GET /stats": "Get basic statistics"
+        }
+    }
 
 
 if __name__ == "__main__":
