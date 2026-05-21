@@ -104,6 +104,7 @@ class VideosResponse(BaseModel):
     total: int
     filters_applied: dict
     videos: List[VideoResponse]
+    last_refreshed: Optional[str] = None 
 
 
 class ScrapeResponse(BaseModel):
@@ -182,9 +183,7 @@ async def get_videos(
         hours_ago_max=hours_ago_max, channel=channel
     )
     
-    # Get last successful scrape with IST timezone
-    
-    
+    # Get last successful scrape date and time in IST
     result = await db.execute(
         select(ScrapeLog)
         .where(ScrapeLog.status == "completed")
@@ -193,20 +192,13 @@ async def get_videos(
     )
     last_scrape = result.scalar_one_or_none()
     
-    last_scrape_info = None
+    last_refreshed = None
     if last_scrape and last_scrape.completed_at:
         # Convert UTC to IST
         ist_timezone = ZoneInfo("Asia/Kolkata")
         completed_ist = last_scrape.completed_at.replace(tzinfo=timezone.utc).astimezone(ist_timezone)
-        
-        last_scrape_info = {
-            "last_scrape_ist": completed_ist.strftime("%Y-%m-%d %I:%M:%S %p"),
-            "last_scrape_date": completed_ist.strftime("%Y-%m-%d"),
-            "last_scrape_time": completed_ist.strftime("%I:%M:%S %p"),
-            "last_scrape_full": completed_ist.strftime("%d %B %Y at %I:%M:%S %p IST"),
-            "total_videos_saved": last_scrape.total_saved,
-            "source": last_scrape.source
-        }
+        # Format: "15 January 2024 at 11:05:30 AM IST"
+        last_refreshed = completed_ist.strftime("%d %B %Y at %I:%M:%S %p IST")
     
     return VideosResponse(
         success=True, 
@@ -220,8 +212,9 @@ async def get_videos(
             "sort_order": sort_order
         },
         videos=[VideoResponse.model_validate(v) for v in videos],
-        last_scrape_info=last_scrape_info  # Add this to your response model
+        last_refreshed=last_refreshed  # Add the last refreshed date
     )
+
 
 
 # =============================================================
