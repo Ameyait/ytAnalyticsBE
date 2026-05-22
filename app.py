@@ -39,10 +39,10 @@ class ScheduledScraper:
             deleted_count = await VideoCRUD.delete_old_videos(db, days=3)
             await db.commit()
             self.last_scrape_time = datetime.now(IST)
-            print(f"✅ {source} scrape completed: {len(saved_videos)} saved, {deleted_count} deleted")
+            print(f" {source} scrape completed: {len(saved_videos)} saved, {deleted_count} deleted")
             return {"success": True, "new_videos": len(saved_videos), "deleted_old": deleted_count}
         except Exception as e:
-            print(f"❌ {source} scrape failed: {e}")
+            print(f" {source} scrape failed: {e}")
             await db.rollback()
             return None
         finally:
@@ -216,70 +216,8 @@ async def get_videos(
     )
 
 
-@app.get("/categories/stats")
-async def get_category_stats(db: AsyncSession = Depends(get_db)):
-    """Get video counts by category"""
-    from sqlalchemy import select, func
-    
-    categories = ["rhymes", "stories", "cartoon", "animation", "birds", "bedtime", "moral"]
-    stats = {}
-    
-    for cat in categories:
-        result = await db.execute(
-            select(func.count()).where(Video.group_category == cat)
-        )
-        stats[cat] = result.scalar() or 0
-    
-    return {
-        "categories": stats,
-        "total": sum(stats.values())
-    }
 
 
-@app.get("/animations", response_model=VideosResponse)
-async def get_animations(
-    page: int = Query(1, ge=1),
-    limit: int = Query(50, ge=1, le=500),
-    search: Optional[str] = None,
-    sort_by: str = "views",
-    sort_order: str = "desc",
-    db: AsyncSession = Depends(get_db)
-):
-    """Convenience endpoint to get only animation videos"""
-    skip = (page - 1) * limit
-    videos, total = await VideoCRUD.get_all_videos(
-        db, skip=skip, limit=limit, category="animation", search=search,
-        sort_by=sort_by, sort_order=sort_order
-    )
-    
-    return VideosResponse(
-        success=True, total=total,
-        filters_applied={"category": "animation", "page": page, "limit": limit},
-        videos=[VideoResponse.model_validate(v) for v in videos]
-    )
-
-
-@app.get("/cartoons", response_model=VideosResponse)
-async def get_cartoons(
-    page: int = Query(1, ge=1),
-    limit: int = Query(50, ge=1, le=500),
-    search: Optional[str] = None,
-    sort_by: str = "views",
-    sort_order: str = "desc",
-    db: AsyncSession = Depends(get_db)
-):
-    """Convenience endpoint to get only cartoon videos"""
-    skip = (page - 1) * limit
-    videos, total = await VideoCRUD.get_all_videos(
-        db, skip=skip, limit=limit, category="cartoon", search=search,
-        sort_by=sort_by, sort_order=sort_order
-    )
-    
-    return VideosResponse(
-        success=True, total=total,
-        filters_applied={"category": "cartoon", "page": page, "limit": limit},
-        videos=[VideoResponse.model_validate(v) for v in videos]
-    )
 
 
 @app.post("/scrape", response_model=ScrapeResponse)
@@ -336,30 +274,6 @@ async def cleanup_old_videos(days: int = Query(3, ge=1, le=30), db: AsyncSession
     await db.commit()
     return CleanupResponse(success=True, deleted_count=deleted_count, remaining_videos=remaining, message=f"Deleted {deleted_count} videos older than {days} days")
 
-
-@app.get("/stats")
-async def get_stats(db: AsyncSession = Depends(get_db)):
-    from sqlalchemy import select, func
-    total_result = await db.execute(select(func.count()).select_from(Video))
-    
-    result = await db.execute(
-        select(ScrapeLog)
-        .where(ScrapeLog.status == "completed")
-        .order_by(desc(ScrapeLog.completed_at))
-        .limit(1)
-    )
-    last_scrape = result.scalar_one_or_none()
-    
-    last_refreshed = None
-    if last_scrape and last_scrape.completed_at:
-        ist_timezone = ZoneInfo("Asia/Kolkata")
-        completed_ist = last_scrape.completed_at.replace(tzinfo=timezone.utc).astimezone(ist_timezone)
-        last_refreshed = completed_ist.strftime("%d %B %Y at %I:%M:%S %p IST")
-    
-    return {
-        "total_videos": total_result.scalar() or 0,
-        "last_refreshed": last_refreshed
-    }
 
 
 @app.get("/")

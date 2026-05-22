@@ -65,9 +65,7 @@ class YouTubeService:
             "unboxing", "vlog", "prank", "challenge", "hack", "tutorial",
             "adult", "18+", "hot", "sexy", "romance", "couple",
             # Exclude rhymes, cartoons, animations as requested
-            "rhyme", "nursery", "lullaby", "balaganapam", "song",
-            "cartoon", "toons", "animation", "animated", "anime",
-            "bedtime", "fairy", "tale", "night",
+            
         ]
         
         self.ALLOWED_CATEGORIES = {"1", "22", "23", "24", "27", "15"}
