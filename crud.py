@@ -10,7 +10,14 @@ from schemas import VideoBase
 class VideoCRUD:
     @staticmethod
     async def create_video(db: AsyncSession, video_data: VideoBase) -> Video:
-        video = Video(**video_data.model_dump())
+        video_dict = video_data.model_dump()
+        # Handle JSON fields
+        if video_dict.get('matched_keywords') is None:
+            video_dict['matched_keywords'] = []
+        if video_dict.get('matched_terms') is None:
+            video_dict['matched_terms'] = ""
+        
+        video = Video(**video_dict)
         db.add(video)
         await db.flush()
         return video
@@ -26,14 +33,25 @@ class VideoCRUD:
     async def create_or_update_video(db: AsyncSession, video_data: VideoBase) -> Video:
         existing = await VideoCRUD.get_video_by_id(db, video_data.video_id)
         
+        video_dict = video_data.model_dump()
+        # Handle JSON fields
+        if video_dict.get('matched_keywords') is None:
+            video_dict['matched_keywords'] = []
+        if video_dict.get('matched_terms') is None:
+            video_dict['matched_terms'] = ""
+        
         if existing:
-            for key, value in video_data.model_dump().items():
-                setattr(existing, key, value)
+            for key, value in video_dict.items():
+                if hasattr(existing, key):
+                    setattr(existing, key, value)
             existing.updated_at = datetime.utcnow()
             await db.flush()
             return existing
         else:
-            return await VideoCRUD.create_video(db, video_data)
+            video = Video(**video_dict)
+            db.add(video)
+            await db.flush()
+            return video
 
     @staticmethod
     async def bulk_create_or_update(db: AsyncSession, videos_data: List[VideoBase]) -> List[Video]:
@@ -41,7 +59,7 @@ class VideoCRUD:
         for video_data in videos_data:
             video = await VideoCRUD.create_or_update_video(db, video_data)
             videos.append(video)
-        await db.flush()
+        await db.commit()
         return videos
 
     @staticmethod

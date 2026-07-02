@@ -1,29 +1,48 @@
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    create_async_engine,
+    AsyncSession,
+    async_sessionmaker,
+)
 from sqlalchemy.orm import declarative_base
 
 from config import config
 
-# Create async engine
+# ============================================================
+# PostgreSQL Async Engine
+# ============================================================
 engine = create_async_engine(
     config.DATABASE_URL,
-    echo=False,
+    echo=False,               # Set True while debugging
     pool_size=10,
     max_overflow=20,
+    pool_pre_ping=True,       # Checks connection before using it
+    pool_recycle=3600,        # Recycle connections every hour
 )
 
-# Create async session factory
+# ============================================================
+# Async Session Factory
+# ============================================================
 AsyncSessionLocal = async_sessionmaker(
-    engine,
+    bind=engine,
     class_=AsyncSession,
     expire_on_commit=False,
+    autoflush=False,
+    autocommit=False,
 )
 
-# Base class for models
+# ============================================================
+# Base Class
+# ============================================================
 Base = declarative_base()
 
 
+# ============================================================
+# Database Dependency
+# ============================================================
 async def get_db():
-    """Dependency to get database session"""
+    """
+    FastAPI Dependency
+    """
     async with AsyncSessionLocal() as session:
         try:
             yield session
@@ -35,7 +54,16 @@ async def get_db():
             await session.close()
 
 
+# ============================================================
+# Initialize Database
+# ============================================================
 async def init_db():
-    """Initialize database tables"""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+# ============================================================
+# Close Database Engine
+# ============================================================
+async def close_db():
+    await engine.dispose()
