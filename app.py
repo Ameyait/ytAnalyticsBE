@@ -33,7 +33,7 @@ class ScheduledScraper:
         
         self.is_running = True
         try:
-            print(f"🔄 Starting {source} scrape at {datetime.now(IST)}")
+            print(f"Starting {source} scrape at {datetime.now(IST)}")
             videos, stats = await scraper_service.scrape_all_videos()
             saved_videos = await VideoCRUD.bulk_create_or_update(db, videos)
             deleted_count = await VideoCRUD.delete_old_videos(db, days=3)
@@ -49,7 +49,7 @@ class ScheduledScraper:
             self.is_running = False
     
     async def run_scheduler(self):
-        print("🕐 Scheduler started - Will run at 11:00 AM and 5:00 PM IST daily")
+        print(" Scheduler started - Will run at 11:00 AM and 5:00 PM IST daily")
         while True:
             now = datetime.now(IST)
             target_11am = now.replace(hour=11, minute=0, second=0, microsecond=0)
@@ -63,7 +63,7 @@ class ScheduledScraper:
                 next_run = target_11am + timedelta(days=1)
             
             wait_seconds = (next_run - now).total_seconds()
-            print(f"⏰ Next scheduled scrape at: {next_run.strftime('%Y-%m-%d %H:%M:%S IST')}")
+            print(f" Next scheduled scrape at: {next_run.strftime('%Y-%m-%d %H:%M:%S IST')}")
             await asyncio.sleep(wait_seconds)
             
             current_time = datetime.now(IST)
@@ -82,8 +82,8 @@ class VideoResponse(BaseModel):
     video_id: str
     title: str
     channel: str
-    channel_id: Optional[str] = None  # ADD THIS
-    channel_url: Optional[str] = None  # ADD THIS - YouTube channel link
+    channel_id: Optional[str] = None
+    channel_url: Optional[str] = None
     views: int
     likes: int
     comments: int
@@ -101,9 +101,14 @@ class VideoResponse(BaseModel):
         from_attributes = True
 
 
-class VideosResponse(BaseModel):
+class PaginatedVideosResponse(BaseModel):
     success: bool
     total: int
+    page: int
+    limit: int
+    total_pages: int
+    has_next: bool
+    has_previous: bool
     filters_applied: dict
     videos: List[VideoResponse]
     last_refreshed: Optional[str] = None
@@ -128,7 +133,7 @@ async def lifespan(app: FastAPI):
     await init_db()
     print("Database initialized")
     scheduler_task = asyncio.create_task(scheduler.run_scheduler())
-    print("✅ Scheduler started - Will scrape at 11 AM and 5 PM IST daily")
+    print("Scheduler started - Will scrape at 11 AM and 5 PM IST daily")
     yield
     scheduler_task.cancel()
     print("Shutting down...")
@@ -149,14 +154,10 @@ app.add_middleware(
 )
 
 
-# =============================================================
-# UPDATED GET VIDEOS ENDPOINT WITH CHANNEL URL
-# =============================================================
-
-@app.get("/videos", response_model=VideosResponse)
+@app.get("/videos", response_model=PaginatedVideosResponse)
 async def get_videos(
-    page: int = Query(1, ge=1),
-    limit: int = Query(50, ge=1, le=500),
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(30, ge=1, le=500, description="Number of records per page (default: 30)"),
     category: Optional[str] = Query(None, description="Filter by category"),
     search: Optional[str] = Query(None, description="Search in title and channel"),
     sort_by: str = Query("views", description="Sort field"),
@@ -185,6 +186,11 @@ async def get_videos(
         hours_ago_max=hours_ago_max, channel=channel
     )
     
+    # Calculate pagination metadata
+    total_pages = (total + limit - 1) // limit if total > 0 else 0
+    has_next = page < total_pages
+    has_previous = page > 1
+    
     # Get last successful scrape date and time in IST
     result = await db.execute(
         select(ScrapeLog)
@@ -200,13 +206,18 @@ async def get_videos(
         completed_ist = last_scrape.completed_at.replace(tzinfo=timezone.utc).astimezone(ist_timezone)
         last_refreshed = completed_ist.strftime("%d %B %Y at %I:%M:%S %p IST")
     
-    return VideosResponse(
-        success=True, 
+    return PaginatedVideosResponse(
+        success=True,
         total=total,
+        page=page,
+        limit=limit,
+        total_pages=total_pages,
+        has_next=has_next,
+        has_previous=has_previous,
         filters_applied={
-            "page": page, 
-            "limit": limit, 
-            "category": category, 
+            "page": page,
+            "limit": limit,
+            "category": category,
             "search": search,
             "sort_by": sort_by,
             "sort_order": sort_order
@@ -214,10 +225,6 @@ async def get_videos(
         videos=[VideoResponse.model_validate(v) for v in videos],
         last_refreshed=last_refreshed
     )
-
-
-
-
 
 
 @app.post("/scrape", response_model=ScrapeResponse)
@@ -275,7 +282,6 @@ async def cleanup_old_videos(days: int = Query(3, ge=1, le=30), db: AsyncSession
     return CleanupResponse(success=True, deleted_count=deleted_count, remaining_videos=remaining, message=f"Deleted {deleted_count} videos older than {days} days")
 
 
-
 @app.get("/")
 async def root():
     return {
@@ -283,7 +289,7 @@ async def root():
         "version": "1.0.0",
         "categories": ["rhymes", "stories", "cartoon", "animation", "birds", "bedtime", "moral"],
         "endpoints": {
-            "GET /videos": "Get videos with category filter (includes channel URL and last refreshed date)",
+            "GET /videos": "Get videos with pagination (30 per page by default) and category filter",
             "GET /animations": "Get only animation videos",
             "GET /cartoons": "Get only cartoon videos",
             "GET /categories/stats": "Get category statistics",
