@@ -326,16 +326,57 @@ class YouTubeService:
         ]
         
         self.MUST_NOT_CONTAIN = [
-            "trailer", "teaser", "movie", "film", "cinema",
-            "review", "reaction", "interview",
-            "gaming", "gameplay", "gta", "minecraft", "freefire",
-            "news", "breaking", "election", "government",
-            "cricket", "ipl", "match", "football",
-            "web series", "serial", "prank", "vlog",
-            "adult", "18+", "romance", "couple", "short film",
-            "live", "streaming", "podcast", "behind the scenes",
-            *self.NON_TELUGU_BLOCKERS,
-        ]
+                # Movies
+                "movie", "movies", "film", "cinema", "trailer", "teaser",
+                "short film", "web series", "serial", "episode", "scene",
+                "movie clip", "movie scene", "promo",
+
+                # Love / Romance
+                "love", "love story", "love stories", "lovestory",
+                "romance", "romantic", "romantic story",
+                "couple", "crush", "dating", "proposal",
+                "boyfriend", "girlfriend", "relationship",
+                "kiss", "kissing", "hug", "valentine",
+
+                # Adult
+                "adult", "18+", "18 plus",
+                "sex", "sexual", "sexy",
+                "hot", "hot scene", "bed scene",
+                "honeymoon", "affair", "extramarital",
+                "sensual", "seductive", "bold",
+                "bikini", "lingerie",
+
+                # Telugu adult
+                "ప్రేమ", "ప్రేమ కథ", "ప్రేమకథ",
+                "రోమాన్స్", "రోమాంటిక్",
+                "సెక్స్", "సెక్సీ",
+                "ముద్దు", "లవ్", "లవ్ స్టోరీ",
+                "అక్రమ సంబంధం",
+
+                # Violence
+                "murder", "kill", "killing", "crime",
+                "gangster", "gun", "blood",
+                "revenge", "horror", "ghost", "zombie",
+
+                # Gaming
+                "gaming", "gameplay", "gta",
+                "minecraft", "free fire", "freefire",
+                "pubg", "bgmi", "roblox",
+
+                # News
+                "news", "breaking", "election",
+                "government", "politics",
+
+                # Sports
+                "cricket", "ipl", "football", "match",
+
+                # Misc
+                "review", "reaction", "interview",
+                "prank", "vlog", "podcast",
+                "live", "streaming",
+
+                *self.NON_TELUGU_BLOCKERS,
+            ]
         
         self.CHANNEL_BLACKLIST = {
             "t series", "zeemusic", "sony music", 
