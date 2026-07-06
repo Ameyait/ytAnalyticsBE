@@ -326,58 +326,37 @@ class YouTubeService:
         ]
         
         self.MUST_NOT_CONTAIN = [
-                # Movies
-                "movie", "movies", "film", "cinema", "trailer", "teaser",
-                "short film", "web series", "serial", "episode", "scene",
-                "movie clip", "movie scene", "promo",
+    "movie", "film", "cinema",
+    "trailer", "teaser",
+    "serial", "episode",
 
-                # Love / Romance
-                "love", "love story", "love stories", "lovestory",
-                "romance", "romantic", "romantic story",
-                "couple", "crush", "dating", "proposal",
-                "boyfriend", "girlfriend", "relationship",
-                "kiss", "kissing", "hug", "valentine",
+    "love", "romance", "romantic",
+    "couple", "dating",
+    "boyfriend", "girlfriend",
 
-                # Adult
-                "adult", "18+", "18 plus",
-                "sex", "sexual", "sexy",
-                "hot", "hot scene", "bed scene",
-                "honeymoon", "affair", "extramarital",
-                "sensual", "seductive", "bold",
-                "bikini", "lingerie",
+    "adult", "18+", "sex", "sexual", "sexy",
+    "hot", "affair",
 
-                # Telugu adult
-                "ప్రేమ", "ప్రేమ కథ", "ప్రేమకథ",
-                "రోమాన్స్", "రోమాంటిక్",
-                "సెక్స్", "సెక్సీ",
-                "ముద్దు", "లవ్", "లవ్ స్టోరీ",
-                "అక్రమ సంబంధం",
+    "ప్రేమ", "రోమాన్స్",
+    "సెక్స్", "లవ్",
 
-                # Violence
-                "murder", "kill", "killing", "crime",
-                "gangster", "gun", "blood",
-                "revenge", "horror", "ghost", "zombie",
+    "murder", "kill", "crime",
+    "gangster", "ghost",
 
-                # Gaming
-                "gaming", "gameplay", "gta",
-                "minecraft", "free fire", "freefire",
-                "pubg", "bgmi", "roblox",
+    "gaming", "gameplay",
+    "gta", "minecraft",
+    "free fire", "pubg",
 
-                # News
-                "news", "breaking", "election",
-                "government", "politics",
+    "news", "breaking",
+    "election",
 
-                # Sports
-                "cricket", "ipl", "football", "match",
+    "cricket", "ipl",
 
-                # Misc
-                "review", "reaction", "interview",
-                "prank", "vlog", "podcast",
-                "live", "streaming",
-
-                *self.NON_TELUGU_BLOCKERS,
-            ]
-        
+    "review", "reaction",
+    "interview", "prank",
+    "vlog", "podcast",
+    "live",
+]
         self.CHANNEL_BLACKLIST = {
             "t series", "zeemusic", "sony music", 
             "tips official", "wave music", "speed records",
