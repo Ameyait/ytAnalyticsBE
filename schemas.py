@@ -12,6 +12,7 @@ class VideoCategoryEnum(str, Enum):
     BIRDS = "birds"
     BEDTIME = "bedtime"
     MORAL = "moral"
+    ANIMALS = "animals"
 
 
 class VideoBase(BaseModel):

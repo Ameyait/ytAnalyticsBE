@@ -82,8 +82,8 @@ class VideoResponse(BaseModel):
     video_id: str
     title: str
     channel: str
-    channel_id: Optional[str] = None
-    channel_url: Optional[str] = None
+    channel_id: Optional[str] = None  # ADD THIS
+    channel_url: Optional[str] = None  # ADD THIS - YouTube channel link
     views: int
     likes: int
     comments: int
@@ -101,14 +101,9 @@ class VideoResponse(BaseModel):
         from_attributes = True
 
 
-class PaginatedVideosResponse(BaseModel):
+class VideosResponse(BaseModel):
     success: bool
     total: int
-    page: int
-    limit: int
-    total_pages: int
-    has_next: bool
-    has_previous: bool
     filters_applied: dict
     videos: List[VideoResponse]
     last_refreshed: Optional[str] = None
@@ -145,7 +140,6 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://13.127.71.122:3000",
-        "http://13.234.115.183:3000",
         "http://localhost:3000",
         "http://127.0.0.1:3000"
     ],
@@ -155,10 +149,14 @@ app.add_middleware(
 )
 
 
-@app.get("/videos", response_model=PaginatedVideosResponse)
+# =============================================================
+# UPDATED GET VIDEOS ENDPOINT WITH CHANNEL URL
+# =============================================================
+
+@app.get("/videos", response_model=VideosResponse)
 async def get_videos(
-    page: int = Query(1, ge=1, description="Page number"),
-    limit: int = Query(30, ge=1, le=500, description="Number of records per page (default: 30)"),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=500),
     category: Optional[str] = Query(None, description="Filter by category"),
     search: Optional[str] = Query(None, description="Search in title and channel"),
     sort_by: str = Query("views", description="Sort field"),
@@ -172,7 +170,7 @@ async def get_videos(
     db: AsyncSession = Depends(get_db)
 ):
     # Validate category
-    allowed_categories = ["rhymes", "stories", "cartoon", "animation", "birds", "bedtime", "moral"]
+    allowed_categories = ["rhymes", "stories", "cartoon", "animation", "birds", "bedtime", "moral", "animals"]
     if category and category not in allowed_categories:
         raise HTTPException(
             status_code=400, 
@@ -186,11 +184,6 @@ async def get_videos(
         max_views=max_views, min_duration=min_duration, max_duration=max_duration,
         hours_ago_max=hours_ago_max, channel=channel
     )
-    
-    # Calculate pagination metadata
-    total_pages = (total + limit - 1) // limit if total > 0 else 0
-    has_next = page < total_pages
-    has_previous = page > 1
     
     # Get last successful scrape date and time in IST
     result = await db.execute(
@@ -207,18 +200,13 @@ async def get_videos(
         completed_ist = last_scrape.completed_at.replace(tzinfo=timezone.utc).astimezone(ist_timezone)
         last_refreshed = completed_ist.strftime("%d %B %Y at %I:%M:%S %p IST")
     
-    return PaginatedVideosResponse(
-        success=True,
+    return VideosResponse(
+        success=True, 
         total=total,
-        page=page,
-        limit=limit,
-        total_pages=total_pages,
-        has_next=has_next,
-        has_previous=has_previous,
         filters_applied={
-            "page": page,
-            "limit": limit,
-            "category": category,
+            "page": page, 
+            "limit": limit, 
+            "category": category, 
             "search": search,
             "sort_by": sort_by,
             "sort_order": sort_order
@@ -226,6 +214,10 @@ async def get_videos(
         videos=[VideoResponse.model_validate(v) for v in videos],
         last_refreshed=last_refreshed
     )
+
+
+
+
 
 
 @app.post("/scrape", response_model=ScrapeResponse)
@@ -283,14 +275,15 @@ async def cleanup_old_videos(days: int = Query(3, ge=1, le=30), db: AsyncSession
     return CleanupResponse(success=True, deleted_count=deleted_count, remaining_videos=remaining, message=f"Deleted {deleted_count} videos older than {days} days")
 
 
+
 @app.get("/")
 async def root():
     return {
         "api": "YouTube Telugu Kids Content API",
         "version": "1.0.0",
-        "categories": ["rhymes", "stories", "cartoon", "animation", "birds", "bedtime", "moral"],
+        "categories": ["rhymes", "stories", "cartoon", "animation", "birds", "bedtime", "moral", "animals"],
         "endpoints": {
-            "GET /videos": "Get videos with pagination (30 per page by default) and category filter",
+            "GET /videos": "Get videos with category filter (includes channel URL and last refreshed date)",
             "GET /animations": "Get only animation videos",
             "GET /cartoons": "Get only cartoon videos",
             "GET /categories/stats": "Get category statistics",

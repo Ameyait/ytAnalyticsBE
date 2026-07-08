@@ -13,7 +13,8 @@ class ScraperService:
     async def scrape_all_videos(self) -> Tuple[List[VideoBase], Dict[str, Any]]:
         """
         Scrape all videos using the enhanced YouTube service
-        Returns all 7 categories: birds, rhymes, cartoon, animation, bedtime, moral, stories
+        Returns all 8 categories: birds, animals, rhymes, cartoon, animation,
+        bedtime, moral, stories
         """
         
         # Use the new fetch_all_videos method for optimized search
@@ -24,6 +25,7 @@ class ScraperService:
         # Map string category to enum
         group_map = {
             "birds": VideoCategoryEnum.BIRDS,
+            "animals": VideoCategoryEnum.ANIMALS,
             "rhymes": VideoCategoryEnum.RHYMES,
             "cartoon": VideoCategoryEnum.CARTOON,
             "animation": VideoCategoryEnum.ANIMATION,
@@ -61,19 +63,25 @@ class ScraperService:
             "quota_used": self.youtube_service.quota_used,
             "quota_limit": self.youtube_service.quota_limit,
             "quota_percentage": (self.youtube_service.quota_used / self.youtube_service.quota_limit) * 100 if self.youtube_service.quota_limit else 0,
+            # Search-call budget is the ACTUAL binding constraint (its own
+            # 100-calls/day bucket) — surfaced separately from the shared
+            # unit pool above so it's easy to monitor at a glance.
+            "search_calls_used": self.youtube_service.search_calls_used,
+            "search_calls_limit": self.youtube_service.search_calls_limit,
             "duplicates_filtered": self.youtube_service.metrics["duplicates_filtered"],
             "quality_filtered": self.youtube_service.metrics["quality_filtered"],
             "total_time_seconds": self.youtube_service.metrics.get("total_time_seconds", 0),
         }
         
         print(f"\n✅ Scraping completed: {len(videos)} videos saved")
-        print(f"📊 Quota used: {self.youtube_service.quota_used}/{self.youtube_service.quota_limit} ({stats['quota_percentage']:.1f}%)")
+        print(f"🔍 Search calls used: {stats['search_calls_used']}/{stats['search_calls_limit']} (today, resets midnight PT)")
+        print(f"📊 Unit quota used: {self.youtube_service.quota_used}/{self.youtube_service.quota_limit} ({stats['quota_percentage']:.1f}%)")
         print(f"🔄 Duplicates filtered: {stats['duplicates_filtered']}")
         print(f"🎨 Quality filtered: {stats['quality_filtered']}")
         print(f"⏱️  Time taken: {stats['total_time_seconds']:.2f} seconds")
         
         # Print category breakdown
-        category_counts = {}
+        category_counts = {}  
         for v in videos:
             cat = v.group_category.value
             category_counts[cat] = category_counts.get(cat, 0) + 1

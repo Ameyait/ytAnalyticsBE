@@ -11,8 +11,9 @@ from googleapiclient.errors import HttpError
 
 from config import config
 
-# Define IST timezone
+# Define timezones
 IST = ZoneInfo("Asia/Kolkata")
+PACIFIC = ZoneInfo("America/Los_Angeles")  # YouTube quota resets at midnight PT
 
 
 @dataclass
@@ -92,6 +93,7 @@ class BatchProcessor:
             batch_results = await processor_func(batch, **kwargs)
             results.extend(batch_results)
             
+            # Adaptive delay based on quota usage
             if i + self.batch_size < len(items):
                 await asyncio.sleep(self.delay_seconds)
         
@@ -104,18 +106,34 @@ class YouTubeService:
         self.youtube = None
         
         # ============================================================
-        # QUOTA SETTINGS
+        # QUOTA SETTINGS — CORRECTED TWO-BUCKET MODEL (verified July 2026)
         # ============================================================
-        
-        self.quota_used = 0
-        self.quota_limit = 10000
+        # Since the June 1, 2026 YouTube Data API change, search.list has
+        # its OWN separate quota bucket, capped at 100 CALLS/day, and each
+        # call costs 1 unit *within that bucket* — it no longer draws from
+        # the shared 10,000-unit/day pool used by videos.list, channels.list,
+        # etc. (Official source: the search.list reference page — "Quota
+        # impact: 100 calls per day. A call to this method has a quota cost
+        # of 1 unit in the Search Queries quota bucket.")
+        #
+        # videos.list (used to fetch stats/details) is also a flat 1 unit
+        # PER CALL regardless of how many video IDs or parts you request —
+        # NOT 1 unit per video ID. (Official quota table: videos.list = 1.)
+        #
+        # Both buckets reset at midnight Pacific Time daily — we track that
+        # explicitly below instead of only resetting on process restart.
+        self.search_calls_used = 0
+        self.search_calls_limit = 90     # real hard ceiling is 100/day; keep a small buffer
+        self.quota_used = 0              # shared 10,000-unit pool (videos.list etc.)
+        self.quota_limit = 9000          # real ceiling is 10,000/day; keep a small buffer
         self.quota_lock = asyncio.Lock()
+        self._quota_reset_date = datetime.now(PACIFIC).date()
         
         # ============================================================
         # DUPLICATE DETECTION
         # ============================================================
         
-        self.video_cache = VideoCache(ttl_minutes=120)
+        self.video_cache = VideoCache(ttl_minutes=120)  # 2 hour cache
         self.seen_urls: Set[str] = set()
         self.seen_hashes: Set[str] = set()
         
@@ -126,185 +144,99 @@ class YouTubeService:
         self.batch_processor = BatchProcessor(batch_size=50, delay_seconds=0.1)
         
         # ============================================================
-        # TARGET: 150-200 VIDEOS PER CATEGORY
+        # NEGATIVE QUERY — blocks romance/junk at the YouTube API level
         # ============================================================
-        self.TARGET_VIDEOS_PER_CATEGORY = 180
-        self.MAX_PAGES_PER_SEARCH = 3  # 3 pages per query (3 * 50 = 150 videos per query)
-        
-        # ============================================================
-        # LANGUAGE FILTERING - STRICTLY TELUGU ONLY
-        # ============================================================
-        
-        self.TELUGU_SCRIPT_RANGE = re.compile(r'[\u0C00-\u0C7F]', re.UNICODE)
-        
-        self.TELUGU_MUST_CONTAIN = [
-            "కథ", "కథలు", "నీతి", "నీతి కథ", "పంచతంత్ర",
-            "పిల్లల", "పిల్లల కథ", "పక్షి", "పక్షులు",
-            "చిలక", "పిచుక", "పావురం", "కాకి",
-            "నర్సరీ", "పాటలు", "పాట", "కార్టూన్", "అనిమేషన్",
-            "నిద్ర", "నిద్ర కథ", "అమ్మ", "నాన్న",
-            "బాలల", "చిన్నారి", "విద్యా", "తెలుగు",
-            "అభ్యాస", "నేర్చుకో", "అద్భుత", "అద్భుత కథ",
-            "తెలివైన", "కాకి", "పాము", "అత్త", "కోడలు",
-        ]
-        
-        self.NON_TELUGU_BLOCKERS = [
-            "hindi", "हिंदी", "हिन्दी", "tamil", "தமிழ்",
-            "malayalam", "മലയാളം", "kannada", "ಕನ್ನಡ",
-            "marathi", "मराठी", "bengali", "বাংলা",
-            "odia", "ଓଡ଼ିଆ", "gujarati", "ગુજરાતી", "punjabi", "ਪੰਜਾਬੀ",
-            "hindi story", "tamil story", "malayalam story", "kannada story",
-            "hindi rhymes", "tamil rhymes", "malayalam rhymes",
-            "dubbed in", "hindi version", "tamil version",
-            "english", "english story", "english rhymes",
-        ]
+        # search.list's `q` param supports the boolean "-" (NOT) operator
+        # per-TERM (not per-phrase), so every token here is a single word.
+        # Appended to EVERY search below so YouTube itself excludes these
+        # before we ever spend a result slot on them (up to 50 results per
+        # call, so keeping junk out at the source matters more than
+        # filtering it out afterward).
+        self.NEGATIVE_QUERY = (
+            "-love -romance -romantic -boyfriend -girlfriend "
+            "-kiss -kissing -lust -adult -18+ "
+            "-movie -film -serial -webseries -episode "
+            "-prank -vlog -reaction -shorts"
+        )
         
         # ============================================================
-        # OPTIMIZED: MULTIPLE FOCUSED SEARCH QUERIES PER CATEGORY
+        # QUOTA-OPTIMIZED, PRIORITY-TIERED SEARCH QUERIES
+        # ============================================================
+        # Each category is a LIST of (query, priority_weight, max_results)
+        # tuples instead of one giant query, because YouTube sorts by
+        # viewCount: OR-ing a 2.0-priority niche term (e.g. "Atha Kodalu
+        # Kathalu") together with a 1.7-priority generic term (e.g. "Telugu
+        # Learning Stories") in the SAME call lets the generic/high-view
+        # term dominate the top-50 results, drowning out the niche one.
+        # Splitting by priority tier gives every weight band its own
+        # dedicated call so nothing gets crowded out.
+        #
+        # 8 final classification buckets (see _determine_group): moral,
+        # animals, birds, rhymes, animation, cartoon, bedtime, stories
+        # (stories has no dedicated search — it's the fallback for videos
+        # that match generic terms in the "moral" tiers below but no
+        # moral/neethi/panchatantra-specific keyword).
+        #
+        # Total = 14 search.list calls per full run. At 2 scrapes/day
+        # that's 28 calls/day, well inside the real 100/day search-call
+        # ceiling (and the 90/day self-imposed buffer above).
         # ============================================================
         
-        self.SEARCH_QUERIES: Dict[str, List[Tuple[str, float]]] = {
-            # MORAL STORIES - 20 queries
+        self.SEARCH_QUERIES: Dict[str, List[Tuple[str, float, int]]] = {
             "moral": [
-                ("Telugu Moral Stories", 1.5),
-                ("Telugu Stories", 1.4),
-                ("Telugu Kathalu", 1.4),
-                ("Neethi Kathalu Telugu", 1.5),
-                ("Neethi Katha Telugu", 1.5),
-                ("Moral Story Telugu", 1.4),
-                ("Panchatantra Telugu", 1.3),
-                ("Telugu Fairy Tales", 1.3),
-                ("Kids Telugu Stories", 1.4),
-                ("Children Telugu Stories", 1.3),
-                ("తెలుగు నీతి కథలు", 1.5),
-                ("తెలుగు పంచతంత్ర కథలు", 1.4),
-                ("నీతి కథలు తెలుగు", 1.5),
-                ("తెలుగు నీతి కథలు పిల్లల కోసం", 1.4),
-                ("తెలుగు మంచి కథలు", 1.3),
-                ("తెలుగు నీతి కథ", 1.4),
-                ("Telugu Moral Stories for Kids", 1.3),
-                ("Telugu Bedtime Stories", 1.2),
-                ("Telugu Learning Stories", 1.2),
-                ("Educational Telugu Stories", 1.2),
+                ("Telugu Moral Stories|Moral Stories in Telugu|Neethi Kathalu Telugu|Neethi Katha Telugu|"
+                 "Atha Kodalu|Atha Kodalu Stories|Atha vs Kodalu|Atha Kodalu Telugu|Atha Kodalu Kathalu|"
+                 "Atta Kodalu Telugu|తెలుగు కథలు|నీతి కథలు|తెలుగు నీతి కథలు|పంచతంత్ర కథలు|అత్త కోడలు|అత్త కోడలు కథలు",
+                 2.0, 50),
+                ("Telugu Stories|Telugu Kathalu|Stories in Telugu|Panchatantra Telugu|Telugu Panchatantra Stories|"
+                 "Kodalu Kathalu|Animated Telugu Moral Story|Animated Panchatantra Telugu",
+                 1.9, 50),
+                ("Kids Telugu Stories|Children Telugu Stories|Telugu Kids Stories|Educational Telugu Stories|"
+                 "Telugu Story for Kids|Animated Telugu Stories",
+                 1.8, 40),
+                ("Telugu Learning Stories|Telugu Bedtime Moral Stories",
+                 1.7, 30),
             ],
-            
-            # ATHA KODALU STORIES - 15 queries
-            "athakodalu": [
-                ("అత్త కోడలు", 1.6),
-                ("అత్త కోడలు కథ", 1.6),
-                ("అత్త కోడలు కథలు", 1.5),
-                ("Atha Kodalu", 1.5),
-                ("Atha vs Kodalu", 1.5),
-                ("Telugu Atha Kodalu", 1.4),
-                ("Telugu Atha Kodalu Stories", 1.4),
-                ("కొడలి కథలు", 1.4),
-                ("కొడలి మాయా కథ", 1.3),
-                ("అత్త కోడలు తెలుగు కథ", 1.5),
-                ("Telugu Inlaw Stories", 1.2),
-                ("Atha Kodalu Telugu", 1.4),
-                ("అత్త vs కోడలు", 1.3),
-                ("మాయా కోడలు", 1.3),
-                ("తెలివైన కోడలు", 1.3),
+            "animals": [
+                ("Animal Stories Telugu|Animals Stories Telugu|Telugu Animal Stories|Animal Kathalu Telugu|"
+                 "సింహం కథ|పులి కథ|ఏనుగు కథ|కోతి కథ|కుందేలు కథ|నక్క కథ|జింక కథ",
+                 2.0, 50),
+                ("Wild Animal Stories Telugu|Jungle Stories Telugu|Lion Stories Telugu|Tiger Stories Telugu|"
+                 "Elephant Stories Telugu|Monkey Stories Telugu|Rabbit Stories Telugu|Fox Stories Telugu|"
+                 "Lion Kathalu Telugu|Tiger Kathalu Telugu|Monkey Kathalu Telugu|Elephant Kathalu Telugu",
+                 1.9, 50),
+                ("Deer Stories Telugu|Dog Stories Telugu|Cat Stories Telugu|Bear Stories Telugu|Wolf Stories Telugu",
+                 1.8, 30),
             ],
-            
-            # BIRD STORIES - 15 queries
             "birds": [
-                ("Bird Stories Telugu", 1.5),
-                ("Telugu Bird Stories", 1.5),
-                ("పక్షి కథ", 1.5),
-                ("పక్షుల కథలు", 1.4),
-                ("చిలక కథ", 1.4),
-                ("చిలక కథలు", 1.3),
-                ("పిచుక కథ", 1.3),
-                ("పావురం కథ", 1.3),
-                ("కాకి కథ", 1.4),
-                ("కాకి పాము కథ", 1.5),
-                ("తెలివైన కాకి", 1.4),
-                ("Telugu Crow Stories", 1.3),
-                ("Telugu Parrot Stories", 1.3),
-                ("Birds Moral Stories Telugu", 1.3),
-                ("పక్షుల నీతి కథలు", 1.4),
+                ("Bird Stories Telugu|Birds Stories Telugu|Chilaka Stories|Chilaka Kathalu|Pichuka Stories|"
+                 "Pichuka Kathalu|Pavuram Stories|Pavuram Kathalu|Kaki Stories|Kaki Kathalu|"
+                 "చిలక కథలు|పిచుక కథలు|కాకి కథలు|పావురం కథలు",
+                 2.0, 50),
+                ("Bird Cartoon Stories Telugu|Crow Stories Telugu|Parrot Stories Telugu",
+                 1.9, 30),
             ],
-            
-            # RHYMES - 15 queries
             "rhymes": [
-                ("Telugu Nursery Rhymes", 1.5),
-                ("Telugu Rhymes", 1.4),
-                ("Kids Rhymes Telugu", 1.4),
-                ("Nursery Rhymes Telugu", 1.5),
-                ("Telugu Kids Songs", 1.4),
-                ("Telugu ABC Songs", 1.3),
-                ("Telugu Learning Songs", 1.3),
-                ("Telugu Baby Songs", 1.3),
-                ("తెలుగు నర్సరీ రైమ్స్", 1.5),
-                ("తెలుగు పిల్లల పాటలు", 1.4),
-                ("తెలుగు రైమ్స్ పిల్లల కోసం", 1.4),
-                ("తెలుగు అభ్యాస పాటలు", 1.3),
-                ("తెలుగు పాటలు పిల్లలు", 1.3),
-                ("Telugu Educational Rhymes", 1.3),
-                ("తెలుగు కిడ్స్ సాంగ్స్", 1.3),
+                ("Telugu Nursery Rhymes|Nursery Rhymes Telugu|Telugu Nursery Rhymes for Kids|Telugu Rhymes|"
+                 "Kids Rhymes Telugu|Telugu Kids Rhymes",
+                 1.9, 50),
+                ("Telugu Kids Songs|Kids Songs Telugu|ABC Songs Telugu|Learning Songs Telugu",
+                 1.8, 30),
             ],
-            
-            # ANIMATION - 15 queries
             "animation": [
-                ("Telugu Animation Stories", 1.5),
-                ("Telugu Cartoon Stories", 1.4),
-                ("Animated Telugu Story", 1.4),
-                ("Animated Moral Story Telugu", 1.4),
-                ("Telugu Kids Animation", 1.3),
-                ("Telugu Fairy Tales", 1.3),
-                ("తెలుగు యానిమేషన్ కథలు", 1.5),
-                ("యానిమేటెడ్ తెలుగు నీతి కథ", 1.4),
-                ("యానిమేషన్ పంచతంత్ర తెలుగు", 1.3),
-                ("తెలుగు యానిమేషన్ స్టోరీస్", 1.3),
-                ("తెలుగు కార్టూన్ కథలు", 1.4),
-                ("Animated Stories for Kids Telugu", 1.3),
-                ("3D Animation Stories Telugu", 1.2),
-                ("Telugu Animated Stories", 1.4),
-                ("Cartoon Stories Telugu", 1.3),
+                ("Telugu Animation Stories|Animated Telugu Stories|Animated Telugu Moral Story|"
+                 "Animated Panchatantra Telugu|Animation Stories Telugu|3D Animation Telugu Stories|"
+                 "Kids Animation Telugu",
+                 1.9, 50),
             ],
-            
-            # BEDTIME / FAIRY TALES - 15 queries
             "bedtime": [
-                ("Telugu Bedtime Stories", 1.5),
-                ("Telugu Fairy Tales", 1.5),
-                ("తెలుగు నిద్ర కథలు", 1.5),
-                ("తెలుగు అద్భుత కథలు", 1.4),
-                ("తెలుగు నైట్ స్టోరీస్", 1.3),
-                ("తెలుగు స్లీప్ కథలు", 1.3),
-                ("తెలుగు ఫెయిరీ టేల్స్", 1.4),
-                ("Telugu Night Stories", 1.3),
-                ("Telugu Sleep Stories", 1.3),
-                ("అద్భుత కథలు తెలుగు", 1.4),
-                ("Telugu Magical Stories", 1.3),
-                ("Fairy Tales in Telugu", 1.4),
-                ("Telugu Bedtime Stories for Kids", 1.3),
-                ("తెలుగు పిల్లల నిద్ర కథలు", 1.3),
-                ("Telugu Lullaby Stories", 1.2),
+                ("Telugu Bedtime Stories|Kids Bedtime Stories Telugu|Telugu Fairy Tales|Sleep Stories Telugu|"
+                 "Night Stories Telugu|Magical Stories Telugu|Bedtime Moral Stories Telugu",
+                 1.9, 40),
             ],
-            
-            # GENERAL STORIES - 20 queries
-            "stories": [
-                ("Telugu Stories", 1.5),
-                ("Telugu Kathalu", 1.4),
-                ("తెలుగు కథలు", 1.5),
-                ("తెలుగు బాలల కథలు", 1.4),
-                ("Telugu Kids Stories", 1.4),
-                ("Kids Story Telugu", 1.3),
-                ("Telugu Moral Stories", 1.4),
-                ("Telugu Fairy Tales", 1.3),
-                ("Telugu Bedtime Stories", 1.3),
-                ("Educational Telugu Stories", 1.3),
-                ("Telugu Children Stories", 1.3),
-                ("తెలుగు పిల్లల కథలు", 1.4),
-                ("Telugu Animated Stories", 1.3),
-                ("Telugu Story for Kids", 1.3),
-                ("తెలుగు కథలు పిల్లల కోసం", 1.4),
-                ("Telugu Moral Stories for Children", 1.3),
-                ("Telugu Short Stories", 1.2),
-                ("తెలుగు విద్యా కథలు", 1.3),
-                ("Telugu Learning Stories", 1.2),
-                ("Telugu Panchatantra Stories", 1.3),
+            "cartoon": [
+                ("Telugu Cartoon Stories|Kids Cartoon Telugu|Cartoon Stories Telugu|Telugu Kids Cartoon Story",
+                 1.9, 40),
             ],
         }
         
@@ -319,44 +251,71 @@ class YouTubeService:
             "rhymes", "nursery", "cartoon", "animation",
             "song", "songs", "learning",
             "bird", "birds", "chilaka", "pichuka", "pavuram", "kaki",
-            "bedtime", "fairy", "fairytale", "tales",
+            "bedtime", "fairy", "fairytale", "fairy tale", "tales",
             "educational",
+            
+            # Animals category
+            "animal", "animals", "jungle", "lion", "tiger", "elephant",
+            "monkey", "rabbit", "fox", "deer", "dog", "cat", "bear", "wolf",
+            
+            # Telugu script
             "కథ", "కథలు", "నీతి", "పిల్లల", "పక్షి",
-            "తెలివైన", "పాము", "అత్త", "కోడలు", "అద్భుత",
+            "సింహం", "పులి", "ఏనుగు", "కోతి", "కుందేలు", "నక్క", "జింక",
         ]
         
         self.MUST_NOT_CONTAIN = [
-    "movie", "film", "cinema",
-    "trailer", "teaser",
-    "serial", "episode",
+            "trailer", "teaser", "movie", "film", "cinema",
+            "review", "reaction", "interview",
+            "gaming", "gameplay", "gta", "minecraft", "freefire", "pubg", "bgmi",
+            "news", "breaking", "election", "government", "politics",
+            "cricket", "ipl", "match", "football",
+            "web series", "serial", "prank", "vlog",
+            "adult", "18+", "short film",
+            "live", "streaming", "podcast", "behind the scenes",
 
-    "love", "romance", "romantic",
-    "couple", "dating",
-    "boyfriend", "girlfriend",
+            # ============================================================
+            # MUSIC/FILM JUNK — needed now that YouTube category 10 (Music)
+            # is allowed (see ALLOWED_CATEGORIES below), so real kids'
+            # rhymes/songs get in without opening the door to movie songs
+            # ============================================================
+            "item song", "music video", "audio song", "video song",
+            "lyrical video", "full video song", "album", "jukebox",
+            "audio jukebox", "dj songs", "remix",
 
-    "adult", "18+", "sex", "sexual", "sexy",
-    "hot", "affair",
+            # ============================================================
+            # ROMANCE / LOVE — backstop behind NEGATIVE_QUERY above (in
+            # case a video slips through the API-level exclusion, e.g. the
+            # term only appears in the description, not the title)
+            # ============================================================
+            "love", "love story", "love stories", "romance", "romantic",
+            "boyfriend", "girlfriend", "crush", "proposal", "kiss", "kissing",
+            "honeymoon", "dating", "relationship", "lust", "affair", "hot", "sexy",
+            "ప్రేమ", "ప్రేమ కథ", "లవ్", "రోమాన్స్", "ముద్దు", "సెక్స్", "వ్యభిచారం",
 
-    "ప్రేమ", "రోమాన్స్",
-    "సెక్స్", "లవ్",
-
-    "murder", "kill", "crime",
-    "gangster", "ghost",
-
-    "gaming", "gameplay",
-    "gta", "minecraft",
-    "free fire", "pubg",
-
-    "news", "breaking",
-    "election",
-
-    "cricket", "ipl",
-
-    "review", "reaction",
-    "interview", "prank",
-    "vlog", "podcast",
-    "live",
-]
+            # ============================================================
+            # OTHER STRICT NEGATIVES FROM ORIGINAL SPEC (previously missing)
+            # ============================================================
+            "astrology", "health tips", "beauty tips", "makeup",
+            "recipe", "cooking", "travel vlog", "comedy show", "standup",
+            "memes", "status", "viral", "challenge", "experiment",
+            "wedding", "festival vlog", "horror", "ghost", "devotional",
+            "crime", "murder", "dance", "shorts",
+            
+            # ============================================================
+            # HINDI LANGUAGE BLOCKERS
+            # ============================================================
+            "hindi", "हिंदी", "हिन्दी",  # Hindi in English and Devanagari
+            "hindi story", "hindi stories", "hindi kahani",
+            "hindi rhymes", "hindi cartoon", "hindi animation",
+            "akbar birbal", "birbal", "अकबर", "बीरबल",
+            "panchtantra stories", "panchatantra hindi",
+            "moral stories in hindi", "hindi moral",
+            "hindi nursery rhymes", "hindi kids",
+            "bal kahani", "bachon ki kahaniyan",
+            "hindi me", "hindi mai",  # "in Hindi"
+        ]
+        
+        # Channel blacklist (low-quality sources)
         self.CHANNEL_BLACKLIST = {
             "t series", "zeemusic", "sony music", 
             "tips official", "wave music", "speed records",
@@ -367,11 +326,22 @@ class YouTubeService:
         # ============================================================
         
         self.ALLOWED_CATEGORIES = {
-            "1", "15", "22", "23", "24", "27"
+            "1",   # Film & Animation
+            "10",  # Music — many Nursery Rhymes / Kids Songs channels file
+                   # here instead of Education, so excluding it was silently
+                   # killing recall for the "rhymes" bucket specifically.
+                   # Safe to allow because MUST_NOT_CONTAIN above now blocks
+                   # item songs / music videos / albums / jukeboxes.
+            "15",  # Pets & Animals — relevant now for the "animals" bucket too
+            "22",  # People & Blogs
+            "23",  # Comedy
+            "24",  # Entertainment
+            "27",  # Education
         }
         
         self.CATEGORY_MAP = {
             "1": "Film & Animation",
+            "10": "Music",
             "15": "Pets & Animals",
             "22": "People & Blogs",
             "23": "Comedy",
@@ -388,21 +358,9 @@ class YouTubeService:
             "total_videos_found": 0,
             "duplicates_filtered": 0,
             "quality_filtered": 0,
-            "non_telugu_filtered": 0,
-            "duration_filtered": 0,
-            "category_filtered": 0,
-            "keyword_filtered": 0,
             "api_calls": 0,
-            "pages_fetched": 0,
             "start_time": None,
-            "rejection_reasons": defaultdict(int),
         }
-        
-        # ============================================================
-        # DISCOVERED TELUGU CHANNELS
-        # ============================================================
-        self.telugu_channels: Set[str] = set()
-        self.channel_cache: Dict[str, Dict] = {}
     
     # ============================================================
     # PROPERTIES
@@ -410,21 +368,47 @@ class YouTubeService:
     
     @property
     def ALL_KEYWORDS(self) -> List[str]:
-        """Backward compatibility - flatten all search queries"""
-        all_queries = []
-        for queries in self.SEARCH_QUERIES.values():
-            for query, _ in queries:
-                all_queries.append(query)
-        return all_queries
+        """Backward compatibility - flatten all search queries (all tiers)"""
+        keywords = []
+        for query_list in self.SEARCH_QUERIES.values():
+            for query, _, _ in query_list:
+                keywords.append(query)
+        return keywords
     
     # ============================================================
-    # QUOTA MANAGEMENT
+    # QUOTA MANAGEMENT — dual bucket, resets daily at midnight Pacific
     # ============================================================
     
-    async def check_quota(self, required_units: int = 100) -> bool:
+    async def _maybe_reset_daily_quota(self):
+        """YouTube resets both quota buckets at midnight Pacific Time.
+        The service instance lives for the lifetime of the app process
+        (created once in ScraperService.__init__), so without this check
+        quota_used/search_calls_used would just accumulate forever and
+        eventually self-throttle every run even though YouTube's real
+        quota had long since reset."""
+        today = datetime.now(PACIFIC).date()
+        if today != self._quota_reset_date:
+            print(f"🔄 New day in Pacific Time ({today}) — resetting quota counters")
+            self.search_calls_used = 0
+            self.quota_used = 0
+            self._quota_reset_date = today
+    
+    async def check_search_quota(self) -> bool:
+        """search.list has its own 100-calls/day bucket (1 unit/call)."""
         async with self.quota_lock:
+            await self._maybe_reset_daily_quota()
+            if self.search_calls_used + 1 > self.search_calls_limit:
+                print(f"⚠ Search-call limit reached! Used: {self.search_calls_used}/{self.search_calls_limit} today")
+                return False
+            self.search_calls_used += 1
+            return True
+    
+    async def check_quota(self, required_units: int = 1) -> bool:
+        """Shared 10,000-unit/day pool (videos.list, channels.list, etc.)."""
+        async with self.quota_lock:
+            await self._maybe_reset_daily_quota()
             if self.quota_used + required_units > self.quota_limit:
-                print(f"⚠ Quota limit reached! Used: {self.quota_used}/{self.quota_limit}")
+                print(f"⚠ Unit quota limit reached! Used: {self.quota_used}/{self.quota_limit}")
                 return False
             self.quota_used += required_units
             return True
@@ -440,69 +424,18 @@ class YouTubeService:
         return self.youtube
     
     # ============================================================
-    # LANGUAGE DETECTION
-    # ============================================================
-    
-    def _is_telugu_only(self, text: str) -> bool:
-        text = text.lower().strip()
-        
-        if re.search(self.TELUGU_SCRIPT_RANGE, text):
-            return True
-        
-        telugu_translit_patterns = [
-            r'\btelugu\b', r'\btelegu\b',
-            r'\btelugu story\b', r'\btelugu stories\b',
-            r'\btelugu rhymes\b', r'\btelugu songs\b',
-            r'\btelugu cartoon\b', r'\btelugu animation\b',
-        ]
-        
-        for pattern in telugu_translit_patterns:
-            if re.search(pattern, text):
-                return True
-        
-        return False
-    
-    def _has_telugu_keywords(self, text: str) -> bool:
-        text = text.lower()
-        for keyword in self.TELUGU_MUST_CONTAIN:
-            if keyword.lower() in text:
-                return True
-        return False
-    
-    def _is_non_telugu_language(self, title: str, channel: str, description: str = "") -> bool:
-        combined_text = f"{title} {channel} {description}".lower()
-        
-        if self._is_telugu_only(combined_text) or self._has_telugu_keywords(combined_text):
-            return False
-        
-        for blocker in self.NON_TELUGU_BLOCKERS:
-            if blocker.lower() in combined_text:
-                return True
-        
-        non_telugu_indicators = [
-            r'\bhindi\b', r'\btamil\b', r'\bmalayalam\b', 
-            r'\bkannada\b', r'\bmarathi\b', r'\bbengali\b',
-            r'\bodiya\b', r'\bgujarati\b', r'\bpunjabi\b',
-            r'\btelugu version\b', r'\bhindi version\b',
-            r'\btamil version\b', r'\bmalayalam version\b',
-            r'\bkannada version\b', r'\bdubbed in\b',
-        ]
-        
-        for pattern in non_telugu_indicators:
-            if re.search(pattern, combined_text):
-                return True
-        
-        return False
-    
-    # ============================================================
     # DURATION PARSER
     # ============================================================
     
     def _parse_duration(self, duration_str: str) -> Tuple[str, int]:
+        """Parse ISO 8601 duration with improved error handling"""
         if not duration_str or duration_str == "PT0S":
             return "0s", 0
         
-        match = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", duration_str)
+        match = re.match(
+            r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?",
+            duration_str
+        )
         
         if not match:
             match = re.match(r"(\d+):(\d+):(\d+)", duration_str)
@@ -529,10 +462,13 @@ class YouTubeService:
         return f"{seconds}s", total
     
     # ============================================================
-    # GROUP DETERMINATION - EXPANDED
+    # GROUP DETERMINATION (maps every sub-keyword to 1 of 8 final buckets)
     # ============================================================
     
     def _determine_group(self, title: str, channel: str) -> str:
+        """Categorize with priority scoring into exactly one of:
+        birds, animals, rhymes, cartoon, animation, bedtime, moral, stories
+        """
         combined = f"{title.lower()} {channel.lower()}"
         
         categories = {
@@ -540,40 +476,41 @@ class YouTubeService:
                 r"\bbird\b", r"\bbirds\b",
                 r"\bchilaka\b", r"\bpichuka\b", r"\bpavuram\b", r"\bkaki\b",
                 "chilaka kathalu", "birds stories", "bird stories",
-                "పక్షి", "పక్షులు", "చిలక", "పిచుక", "పావురం", "కాకి",
-                "కాకి పాము", "crow snake", "తెలివైన కాకి",
             ], 100),
+            
+            "animals": ([
+                r"\banimal\b", r"\banimals\b", r"\bjungle\b", "wild animal",
+                r"\blion\b", r"\btiger\b", r"\belephant\b", r"\bmonkey\b",
+                r"\brabbit\b", r"\bfox\b", r"\bdeer\b", r"\bdog\b", r"\bcat\b",
+                r"\bbear\b", r"\bwolf\b",
+                "సింహం", "పులి", "ఏనుగు", "కోతి", "కుందేలు", "నక్క", "జింక",
+            ], 95),
             
             "rhymes": ([
                 r"\brhyme\b", r"\brhymes\b", r"\bnursery\b",
                 r"\bsong\b", r"\bsongs\b", r"\blullaby\b",
                 "nursery rhymes", "kids rhymes", "learning song", "learning songs",
-                "abc rhymes", "alphabet song",
-                "నర్సరీ", "పాట", "పాటలు",
+                "abc rhymes", "abc songs", "alphabet song",
             ], 90),
             
             "cartoon": ([
                 r"\bcartoon\b", r"\bcartoons\b",
                 "animated cartoon", "telugu cartoon",
-                "కార్టూన్",
             ], 80),
             
             "animation": ([
                 r"\banimation\b",
                 "animated story", "animation story",
-                "యానిమేషన్",
             ], 70),
             
             "bedtime": ([
                 r"\bbedtime\b", "sleep story", "night story",
                 r"\bfairy\s*tale", "fairy tales", "fairytale",
-                "నిద్ర", "అద్భుత",
             ], 60),
             
             "moral": ([
                 r"\bmoral\b", r"\bneethi\b", r"\bneeti\b",
                 r"\bpanchatantra\b", "atha kodalu", "neethi kathalu",
-                "నీతి", "పంచతంత్ర", "అత్త", "కోడలు",
             ], 50),
             
             "stories": ([
@@ -581,8 +518,6 @@ class YouTubeService:
                 r"\bkatha\b", r"\bkathalu\b",
                 "kids story", "telugu stories",
                 r"\beducational\b", "educational story", "educational stories",
-                "కథ", "కథలు", "బాలల", "చిన్నారి", "విద్యా",
-                "అద్భుతమైన",
             ], 10),
         }
         
@@ -600,233 +535,97 @@ class YouTubeService:
         return best_category
     
     # ============================================================
-    # SEARCH WITH MULTIPLE QUERIES PER CATEGORY
+    # SEARCH METHODS
     # ============================================================
     
-    async def search_single_query(
+    async def search_keyword(
         self,
         category: str,
         query: str,
         published_after: str,
         priority: float = 1.0,
+        max_results: int = 50,
     ) -> List[str]:
-        """Execute a single search query with pagination"""
+        """Run one quota-efficient OR-combined search for one priority tier
+        of a final category, with romance/junk excluded at the API level.
+        """
         
-        if not await self.check_quota(100):
+        if not await self.check_search_quota():
             return []
         
         youtube = self._get_client()
         video_ids = []
-        page_token = None
-        pages_fetched = 0
-        
-        while pages_fetched < self.MAX_PAGES_PER_SEARCH:
-            try:
-                loop = asyncio.get_event_loop()
-                
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: youtube.search().list(
-                        part="snippet",
-                        q=query,
-                        type="video",
-                        regionCode="IN",
-                        maxResults=50,
-                        pageToken=page_token,
-                        order="date",
-                        relevanceLanguage="te",
-                        safeSearch="strict",
-                        publishedAfter=published_after,
-                        videoDuration="medium",
-                    ).execute()
-                )
-                
-                pages_fetched += 1
-                self.metrics["pages_fetched"] += 1
-                self.metrics["api_calls"] += 1
-                
-                items = response.get("items", [])
-                
-                if not items:
-                    break
-                
-                # Extract video IDs
-                ids = [item["id"]["videoId"] for item in items]
-                
-                # Track channels
-                for item in items:
-                    channel_id = item["snippet"].get("channelId")
-                    if channel_id:
-                        self.telugu_channels.add(channel_id)
-                
-                # Deduplicate
-                new_ids = []
-                for vid in ids:
-                    if vid not in self.seen_urls:
-                        new_ids.append(vid)
-                        self.seen_urls.add(vid)
-                
-                video_ids.extend(new_ids)
-                
-                # Get next page token
-                page_token = response.get("nextPageToken")
-                if not page_token:
-                    break
-                
-                await asyncio.sleep(0.2)
-                
-            except HttpError as e:
-                print(f"    ⚠️ Search error for '{query}': {e}")
-                if "quota" in str(e).lower():
-                    self.quota_used = self.quota_limit
-                break
-            except Exception as e:
-                print(f"    ⚠️ Unexpected error: {e}")
-                break
-        
-        return list(set(video_ids))
-    
-    async def search_all_queries(self, published_after: str) -> List[str]:
-        """Execute all search queries across all categories"""
-        
-        all_video_ids = []
-        total_queries = sum(len(queries) for queries in self.SEARCH_QUERIES.values())
-        query_count = 0
-        
-        print(f"📊 Total queries to execute: {total_queries}")
-        print("-" * 40)
-        
-        for category, queries in self.SEARCH_QUERIES.items():
-            print(f"\n📂 Category: {category} ({len(queries)} queries)")
-            
-            category_videos = []
-            for query, priority in queries:
-                query_count += 1
-                print(f"  [{query_count}/{total_queries}] 🔍 '{query[:40]}...'")
-                
-                video_ids = await self.search_single_query(
-                    category, query, published_after, priority
-                )
-                category_videos.extend(video_ids)
-                
-                print(f"    → Found {len(video_ids)} new videos")
-                
-                # Rate limiting between queries
-                await asyncio.sleep(0.3)
-            
-            all_video_ids.extend(category_videos)
-            print(f"  ✅ Category total: {len(category_videos)} videos")
-            
-            # Delay between categories
-            await asyncio.sleep(0.5)
-        
-        return list(set(all_video_ids))
-    
-    # ============================================================
-    # CHANNEL-BASED FETCHING
-    # ============================================================
-    
-    async def fetch_channel_uploads(
-        self,
-        channel_id: str,
-        published_after: str,
-        max_videos: int = 50
-    ) -> List[str]:
-        """Fetch videos from a channel's uploads playlist"""
-        
-        if not await self.check_quota(1):
-            return []
-        
-        youtube = self._get_client()
-        video_ids = []
+        full_query = f"{query} {self.NEGATIVE_QUERY}"
         
         try:
             loop = asyncio.get_event_loop()
             
-            channel_response = await loop.run_in_executor(
+            response = await loop.run_in_executor(
                 None,
-                lambda: youtube.channels().list(
-                    part="contentDetails",
-                    id=channel_id
+                lambda: youtube.search().list(
+                    part="snippet",
+                    q=full_query,
+                    type="video",
+                    regionCode="IN",
+                    maxResults=max_results,
+                    order="viewCount",
+                    relevanceLanguage="te",
+                    safeSearch="strict",
+                    publishedAfter=published_after,
+                    videoDuration="medium",
                 ).execute()
             )
             
-            if not channel_response.get("items"):
-                return []
+            ids = [
+                item["id"]["videoId"]
+                for item in response.get("items", [])
+            ]
             
-            uploads_playlist_id = channel_response["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
+            new_ids = []
+            for vid in ids:
+                if vid not in self.seen_urls:
+                    new_ids.append(vid)
+                    self.seen_urls.add(vid)
             
-            page_token = None
-            pages_fetched = 0
+            video_ids.extend(new_ids)
             
-            while pages_fetched < 5:
-                playlist_response = await loop.run_in_executor(
-                    None,
-                    lambda: youtube.playlistItems().list(
-                        part="snippet",
-                        playlistId=uploads_playlist_id,
-                        maxResults=50,
-                        pageToken=page_token
-                    ).execute()
-                )
-                
-                pages_fetched += 1
-                self.metrics["api_calls"] += 1
-                
-                for item in playlist_response.get("items", []):
-                    published_at_str = item["snippet"]["publishedAt"]
-                    if published_at_str >= published_after:
-                        video_id = item["snippet"]["resourceId"]["videoId"]
-                        if video_id not in self.seen_urls:
-                            video_ids.append(video_id)
-                            self.seen_urls.add(video_id)
-                
-                page_token = playlist_response.get("nextPageToken")
-                if not page_token or len(video_ids) >= max_videos:
-                    break
-                
-                await asyncio.sleep(0.2)
+            self.metrics["total_searches"] += 1
+            self.metrics["total_videos_found"] += len(ids)
+            self.metrics["duplicates_filtered"] += (len(ids) - len(new_ids))
+            
+            print(f"✓ [{category}] priority={priority} → {len(new_ids)}/{len(ids)} new "
+                  f"(search calls: {self.search_calls_used}/{self.search_calls_limit} today)")
             
         except HttpError as e:
-            print(f"    ⚠️ Channel fetch error: {e}")
-        except Exception as e:
-            print(f"    ⚠️ Unexpected channel error: {e}")
+            print(f"⚠ Error '{category}' ({query}): {e}")
+            if "quota" in str(e).lower():
+                self.search_calls_used = self.search_calls_limit
         
-        return video_ids
+        return list(set(video_ids))
     
-    async def fetch_from_top_channels(
-        self,
-        published_after: str,
-        max_channels: int = 30
-    ) -> List[str]:
-        """Fetch videos from top discovered Telugu channels"""
-        
-        if not self.telugu_channels:
-            print("  ⚠️ No channels discovered yet")
-            return []
-        
-        print(f"\n📺 Fetching from {min(len(self.telugu_channels), max_channels)} channels...")
-        
+    async def search_all_keywords(self, published_after: str) -> List[str]:
+        """Search using priority-tiered OR-combined queries per category.
+
+        14 calls total per run (2 scrapes/day = 28/day) vs. the real
+        100-calls/day search bucket ceiling — comfortable headroom while
+        covering far more sub-keywords than a single query per category.
+        """
         all_video_ids = []
-        channels_list = list(self.telugu_channels)[:max_channels]
         
-        for idx, channel_id in enumerate(channels_list, 1):
-            print(f"  🎬 Channel {idx}/{len(channels_list)}")
-            video_ids = await self.fetch_channel_uploads(
-                channel_id, published_after, max_videos=100
-            )
-            all_video_ids.extend(video_ids)
-            print(f"    → Found {len(video_ids)} recent videos")
-            
-            await asyncio.sleep(0.3)
+        for category, query_list in self.SEARCH_QUERIES.items():
+            for tier_idx, (query, priority, max_results) in enumerate(query_list, 1):
+                video_ids = await self.search_keyword(category, query, published_after, priority, max_results)
+                all_video_ids.extend(video_ids)
+                await asyncio.sleep(0.2)
         
         return list(set(all_video_ids))
     
     # ============================================================
-    # VIDEO DETAILS METHODS
+    # VIDEO DETAILS METHODS (FIXED)
     # ============================================================
     
     async def fetch_batch_details(self, batch_ids: List[str]) -> List[Dict[str, Any]]:
+        """Fetch details for a batch of videos"""
         youtube = self._get_client()
         videos_data = []
         
@@ -842,7 +641,7 @@ class YouTubeService:
             )
             
             items = response.get("items", [])
-            self.metrics["api_calls"] += 1
+            print(f"  📦 Processing batch of {len(items)} videos...")
             
             for item in items:
                 try:
@@ -850,9 +649,13 @@ class YouTubeService:
                     if video and isinstance(video, dict):
                         videos_data.append(video)
                 except Exception as e:
+                    print(f"    ⚠️ Error processing item: {e}")
                     continue
             
-            await self.check_quota(len(batch_ids))
+            # videos.list costs a flat 1 unit PER CALL, regardless of how
+            # many IDs are in the batch (up to 50) or how many `part`
+            # values are requested — NOT 1 unit per video ID.
+            await self.check_quota(1)
             
         except HttpError as e:
             print(f"  ✗ Batch Details Error: {e}")
@@ -862,6 +665,8 @@ class YouTubeService:
         return videos_data
     
     async def process_video_item(self, item: Dict) -> Optional[Dict[str, Any]]:
+        """Process individual video item with all filters"""
+        
         snippet = item["snippet"]
         stats = item.get("statistics", {})
         content = item.get("contentDetails", {})
@@ -871,86 +676,43 @@ class YouTubeService:
         channel = snippet.get("channelTitle", "")
         channel_id = snippet.get("channelId", "")
         cat_id = snippet.get("categoryId", "")
-        description = snippet.get("description", "")
         
-        # Check 1: Category
+        # Fast filters
         if cat_id not in self.ALLOWED_CATEGORIES:
-            reason = f"category {cat_id} not allowed"
-            self.metrics["rejection_reasons"][reason] += 1
-            self.metrics["category_filtered"] += 1
             return None
         
         title_lower = title.lower()
         channel_lower = channel.lower()
         
-        # Check 2: Language - Non-Telugu
-        if self._is_non_telugu_language(title, channel, description):
-            reason = "non-Telugu language detected"
-            self.metrics["rejection_reasons"][reason] += 1
-            self.metrics["non_telugu_filtered"] += 1
-            return None
-        
-        # Check 3: Telugu script/keywords
-        combined_text = f"{title} {description}".lower()
-        if not self._is_telugu_only(combined_text) and not self._has_telugu_keywords(combined_text):
-            if "telugu" not in title_lower and "telugu" not in channel_lower:
-                reason = "no Telugu script or keywords found"
-                self.metrics["rejection_reasons"][reason] += 1
-                self.metrics["non_telugu_filtered"] += 1
-                return None
-        
-        # Check 4: Channel blacklist
         if any(bad in channel_lower for bad in self.CHANNEL_BLACKLIST):
-            reason = "channel blacklisted"
-            self.metrics["rejection_reasons"][reason] += 1
             self.metrics["quality_filtered"] += 1
             return None
         
-        # Check 5: Must not contain
         if any(bad in title_lower for bad in self.MUST_NOT_CONTAIN):
-            reason = "contains blocked word"
-            self.metrics["rejection_reasons"][reason] += 1
             self.metrics["quality_filtered"] += 1
             return None
         
-        # Check 6: Duration
         raw_dur = content.get("duration", "PT0S")
         duration_text, duration_sec = self._parse_duration(raw_dur)
         
         group = self._determine_group(title, channel)
-        
+
         # Duration limits
         if group == "rhymes":
             if duration_sec < 120 or duration_sec > 1200:
-                reason = f"rhymes duration {duration_sec}s"
-                self.metrics["rejection_reasons"][reason] += 1
-                self.metrics["duration_filtered"] += 1
                 return None
         elif group == "birds":
             if duration_sec < 60 or duration_sec > 900:
-                reason = f"birds duration {duration_sec}s"
-                self.metrics["rejection_reasons"][reason] += 1
-                self.metrics["duration_filtered"] += 1
                 return None
         else:
             if duration_sec < 180 or duration_sec > 1800:
-                reason = f"duration {duration_sec}s"
-                self.metrics["rejection_reasons"][reason] += 1
-                self.metrics["duration_filtered"] += 1
                 return None
         
-        # Check 7: Must contain keywords
         combined = f"{title_lower} {channel_lower}"
         if not any(good in combined for good in self.MUST_CONTAIN_ANY):
-            reason = "missing required keywords"
-            self.metrics["rejection_reasons"][reason] += 1
-            self.metrics["keyword_filtered"] += 1
             return None
         
-        # Check 8: Duplicate detection
         if self.video_cache.is_duplicate(title, channel, duration_sec):
-            reason = "duplicate video"
-            self.metrics["rejection_reasons"][reason] += 1
             self.metrics["duplicates_filtered"] += 1
             return None
         
@@ -959,26 +721,37 @@ class YouTubeService:
         ).hexdigest()
         
         if content_hash in self.seen_hashes:
-            reason = "duplicate hash"
-            self.metrics["rejection_reasons"][reason] += 1
             self.metrics["duplicates_filtered"] += 1
             return None
         
-        # Timezone handling
+        # ============================================================
+        # TIMEZONE HANDLING - FIXED
+        # ============================================================
+        
+        # Step 1: Parse YouTube published time (UTC)
         published_str = snippet.get("publishedAt", "")
         published_at = datetime.strptime(published_str, "%Y-%m-%dT%H:%M:%SZ")
         published_at_utc = published_at.replace(tzinfo=timezone.utc)
         
+        # Step 2: Calculate hours_ago using UTC (for display purposes)
         now_utc = datetime.now(timezone.utc)
         hours_ago = int((now_utc - published_at_utc).total_seconds() / 3600)
         
+        # Step 3: Strip timezone for database storage (since DB uses TIMESTAMP WITHOUT TIME ZONE)
         published_at_naive = published_at_utc.replace(tzinfo=None)
+        
+        # ============================================================
+        # END TIMEZONE HANDLING
+        # ============================================================
+        
+        channel_url = f"https://youtube.com/channel/{channel_id}" if channel_id else ""
         
         video_data = {
             "video_id": video_id,
             "title": title,
             "channel": channel,
             "channel_id": channel_id,
+            "channel_url": channel_url,
             "views": int(stats.get("viewCount", 0)),
             "likes": int(stats.get("likeCount", 0)),
             "comments": int(stats.get("commentCount", 0)),
@@ -987,12 +760,11 @@ class YouTubeService:
             "category": self.CATEGORY_MAP.get(cat_id, "Unknown"),
             "category_id": cat_id,
             "group_category": group,
-            "published_at": published_at_naive,
+            "published_at": published_at_naive,  # <-- NAIVE datetime for DB
             "hours_ago": hours_ago,
             "url": f"https://youtube.com/watch?v={video_id}",
             "thumbnail_url": snippet.get("thumbnails", {}).get("high", {}).get("url", ""),
             "content_hash": content_hash,
-            "is_telugu": True,
         }
         
         self.video_cache.add_video(title, channel, duration_sec, video_id)
@@ -1001,13 +773,12 @@ class YouTubeService:
         return video_data
     
     async def get_video_details(self, video_ids: List[str]) -> List[Dict[str, Any]]:
+        """Get details with batch processing - FIXED: No datetime conversion here"""
+        
         if not video_ids:
             return []
         
         print(f"\n📥 Fetching details for {len(video_ids)} videos...")
-        
-        import random
-        random.shuffle(video_ids)
         
         videos_data = await self.batch_processor.process_batches(
             video_ids,
@@ -1025,27 +796,12 @@ class YouTubeService:
         return all_videos
     
     # ============================================================
-    # SORT AND FILTER BY DATE
-    # ============================================================
-    
-    def filter_by_date_range(self, videos: List[Dict], days: int) -> List[Dict]:
-        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-        cutoff_naive = cutoff.replace(tzinfo=None)
-        
-        filtered = []
-        for video in videos:
-            published = video.get("published_at")
-            if published and isinstance(published, datetime):
-                if published >= cutoff_naive:
-                    filtered.append(video)
-        
-        return filtered
-    
-    # ============================================================
     # DATABASE PREPARATION
     # ============================================================
     
     def prepare_for_database(self, videos: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Prepare video data for efficient database storage"""
+        
         if not videos:
             return {"videos": [], "summary": {}}
         
@@ -1057,44 +813,37 @@ class YouTubeService:
         for category in grouped:
             grouped[category].sort(key=lambda x: x.get("views", 0), reverse=True)
         
-        final_grouped = {}
-        for category, videos_list in grouped.items():
-            final_grouped[category] = videos_list[:self.TARGET_VIDEOS_PER_CATEGORY]
-        
-        final_videos = []
-        for videos_list in final_grouped.values():
-            final_videos.extend(videos_list)
-        
         summary = {
-            "total_videos": len(final_videos),
+            "total_videos": len(videos),
             "categories": {
-                cat: len(videos_list) for cat, videos_list in final_grouped.items()
+                cat: len(videos_list) for cat, videos_list in grouped.items()
             },
-            "total_views": sum(v.get("views", 0) for v in final_videos),
-            "avg_duration": sum(v.get("duration_seconds", 0) for v in final_videos) / len(final_videos) if final_videos else 0,
+            "total_views": sum(v.get("views", 0) for v in videos),
+            "avg_duration": sum(v.get("duration_seconds", 0) for v in videos) / len(videos) if videos else 0,
             "date_range": {
-                "oldest": min(v.get("published_at") for v in final_videos) if final_videos else None,
-                "newest": max(v.get("published_at") for v in final_videos) if final_videos else None,
+                "oldest": min(v.get("published_at") for v in videos) if videos else None,
+                "newest": max(v.get("published_at") for v in videos) if videos else None,
             },
-            "top_channels": self._get_top_channels(final_videos, 10),
+            "top_channels": self._get_top_channels(videos, 10),
         }
         
         return {
-            "videos": final_videos,
-            "grouped_videos": dict(final_grouped),
+            "videos": videos,
+            "grouped_videos": dict(grouped),
             "summary": summary,
             "metadata": {
+                # Keep database metadata in UTC (as string)
                 "fetch_timestamp": datetime.now(timezone.utc).isoformat(),
+                "search_calls_used": self.search_calls_used,
+                "search_calls_limit": self.search_calls_limit,
                 "total_quota_used": self.quota_used,
+                "quota_limit": self.quota_limit,
                 "metrics": self.metrics,
-                "language": "Telugu Only",
-                "channels_discovered": len(self.telugu_channels),
-                "target_per_category": self.TARGET_VIDEOS_PER_CATEGORY,
-                "total_queries": sum(len(queries) for queries in self.SEARCH_QUERIES.values()),
             }
         }
     
     def _get_top_channels(self, videos: List[Dict], limit: int = 10) -> List[Dict]:
+        """Extract top channels by video count"""
         channel_counts = defaultdict(int)
         channel_views = defaultdict(int)
         
@@ -1118,89 +867,43 @@ class YouTubeService:
     # ============================================================
     
     async def fetch_all_videos(self) -> Dict[str, Any]:
-        """Main method with multiple focused search queries"""
+        """Main method to fetch all videos with all improvements"""
         
+        # Update metrics start time to IST
         self.metrics["start_time"] = datetime.now(IST)
         
         print("🚀 Starting YouTube video fetch...")
-        print("🎯 Language: TELUGU ONLY")
-        print(f"🎯 Target: {self.TARGET_VIDEOS_PER_CATEGORY} videos per category")
-        print("=" * 60)
+        print("=" * 50)
         
-        days_back = config.DAYS_BACK
-        published_after = self.get_published_after(days_back)
-        print(f"📅 Fetching videos from last {days_back} days")
-        print(f"📅 Published after: {published_after}")
-        print("=" * 60)
+        published_after = self.get_published_after()
         
-        # STEP 1: SEARCH WITH MULTIPLE QUERIES
-        print("\n🔍 STEP 1: Searching with multiple focused queries...")
-        print("-" * 40)
+        print("📡 Searching for videos...")
+        video_ids = await self.search_all_keywords(published_after)
         
-        search_video_ids = await self.search_all_queries(published_after)
-        print(f"\n📊 Search found {len(search_video_ids)} unique videos")
+        print(f"\n📊 Found {len(video_ids)} unique videos after deduplication")
         
-        # STEP 2: FETCH FROM DISCOVERED CHANNELS
-        print("\n📺 STEP 2: Fetching from discovered channels...")
-        print("-" * 40)
+        print("\n📥 Fetching video details...")
+        videos = await self.get_video_details(video_ids)
         
-        channel_video_ids = await self.fetch_from_top_channels(published_after, max_channels=30)
-        print(f"\n📊 Channel fetch found {len(channel_video_ids)} additional videos")
-        
-        # STEP 3: COMBINE AND DEDUPLICATE
-        print("\n🔄 STEP 3: Combining and deduplicating...")
-        print("-" * 40)
-        
-        all_video_ids = list(set(search_video_ids + channel_video_ids))
-        print(f"📊 Total unique video IDs: {len(all_video_ids)}")
-        
-        # STEP 4: FETCH DETAILS
-        print("\n📥 STEP 4: Fetching video details...")
-        print("-" * 40)
-        
-        videos = await self.get_video_details(all_video_ids)
-        
-        # STEP 5: FILTER BY DATE RANGE
-        print(f"\n📅 STEP 5: Filtering videos from last {days_back} days...")
-        print("-" * 40)
-        
-        videos = self.filter_by_date_range(videos, days_back)
-        print(f"📊 Videos after date filter: {len(videos)}")
-        
-        # STEP 6: SORT BY VIEWS
-        print("\n📊 STEP 6: Sorting by views...")
-        print("-" * 40)
-        
-        videos.sort(key=lambda x: x.get("views", 0), reverse=True)
-        
-        # STEP 7: PREPARE FOR DATABASE
-        print("\n💾 STEP 7: Preparing data for database...")
-        print("-" * 40)
-        
-        db_ready_data = self.prepare_for_database(videos)
-        
-        # FINAL SUMMARY
+        # Update elapsed calculation with IST
         elapsed = (
             datetime.now(IST) - self.metrics["start_time"]
         ).total_seconds()
         self.metrics["total_time_seconds"] = elapsed
         
-        print("\n" + "=" * 60)
+        print("\n💾 Preparing data for database...")
+        db_ready_data = self.prepare_for_database(videos)
+        
+        print("\n" + "=" * 50)
         print("✅ FETCH COMPLETE")
-        print("=" * 60)
-        print(f"📊 Total videos fetched: {len(db_ready_data['videos'])}")
+        print("=" * 50)
+        print(f"📊 Total videos fetched: {len(videos)}")
         print(f"🎯 Categories: {db_ready_data['summary']['categories']}")
         print(f"⏱️  Time taken: {elapsed:.2f} seconds")
-        print(f"💾 Quota used: {self.quota_used}/{self.quota_limit}")
-        print(f"📄 Pages fetched: {self.metrics['pages_fetched']}")
+        print(f"🔍 Search calls used: {self.search_calls_used}/{self.search_calls_limit} (resets midnight PT)")
+        print(f"💾 Unit quota used: {self.quota_used}/{self.quota_limit} (shared pool)")
         print(f"🔄 Duplicates filtered: {self.metrics['duplicates_filtered']}")
         print(f"🎨 Quality filtered: {self.metrics['quality_filtered']}")
-        print(f"🗣️  Non-Telugu filtered: {self.metrics['non_telugu_filtered']}")
-        print(f"⏱️  Duration filtered: {self.metrics['duration_filtered']}")
-        print(f"📂 Category filtered: {self.metrics['category_filtered']}")
-        print(f"📺 Channels discovered: {len(self.telugu_channels)}")
-        print(f"📊 Total queries executed: {sum(len(queries) for queries in self.SEARCH_QUERIES.values())}")
-        print("=" * 60)
         
         return db_ready_data
     
@@ -1209,6 +912,7 @@ class YouTubeService:
     # ============================================================
     
     def get_published_after(self, days: int = None) -> str:
+        """Get ISO format date for filtering - Uses config.DAYS_BACK"""
         if days is None:
             days = config.DAYS_BACK
         
