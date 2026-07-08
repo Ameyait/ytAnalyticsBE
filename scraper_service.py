@@ -12,40 +12,36 @@ class ScraperService:
     
     async def scrape_all_videos(self) -> Tuple[List[VideoBase], Dict[str, Any]]:
         """
-        Scrape all videos using the enhanced YouTube service
-        Returns all 8 categories: birds, animals, rhymes, cartoon, animation,
-        bedtime, moral, stories
+        Scrape all videos using the enhanced YouTube service.
+        Returns the 6 final categories: birds, animals, rhymes, cartoon,
+        bedtime, moral (moral now also absorbs the old "animation" and
+        "stories" buckets).
         """
         
-        # Use the new fetch_all_videos method for optimized search
         result = await self.youtube_service.fetch_all_videos()
         
         videos_data = result.get("videos", [])
         
-        # Map string category to enum
+        # Map string category to enum. Default falls back to MORAL (not
+        # STORIES, which no longer exists) since moral is now the catch-all.
         group_map = {
             "birds": VideoCategoryEnum.BIRDS,
             "animals": VideoCategoryEnum.ANIMALS,
             "rhymes": VideoCategoryEnum.RHYMES,
             "cartoon": VideoCategoryEnum.CARTOON,
-            "animation": VideoCategoryEnum.ANIMATION,
             "bedtime": VideoCategoryEnum.BEDTIME,
             "moral": VideoCategoryEnum.MORAL,
-            "stories": VideoCategoryEnum.STORIES,
         }
         
-        # Convert to VideoBase objects
         videos = []
         for data in videos_data:
             try:
-                group_category = data.get("group_category", "stories")
-                data["group_category"] = group_map.get(group_category, VideoCategoryEnum.STORIES)
+                group_category = data.get("group_category", "moral")
+                data["group_category"] = group_map.get(group_category, VideoCategoryEnum.MORAL)
                 
-                # Remove content_hash as it's not in VideoBase
                 if "content_hash" in data:
                     del data["content_hash"]
                 
-                # ✅ FIX: Convert datetime to string if it's a datetime object
                 if 'published_at' in data and hasattr(data['published_at'], 'isoformat'):
                     data['published_at'] = data['published_at'].isoformat()
                 
@@ -56,16 +52,12 @@ class ScraperService:
                 print(f"Problematic data: {data.get('title', 'Unknown')}")
                 continue
         
-        # Calculate statistics
         stats = {
             "total_videos_found": len(videos_data),
             "videos_after_filter": len(videos),
             "quota_used": self.youtube_service.quota_used,
             "quota_limit": self.youtube_service.quota_limit,
             "quota_percentage": (self.youtube_service.quota_used / self.youtube_service.quota_limit) * 100 if self.youtube_service.quota_limit else 0,
-            # Search-call budget is the ACTUAL binding constraint (its own
-            # 100-calls/day bucket) — surfaced separately from the shared
-            # unit pool above so it's easy to monitor at a glance.
             "search_calls_used": self.youtube_service.search_calls_used,
             "search_calls_limit": self.youtube_service.search_calls_limit,
             "duplicates_filtered": self.youtube_service.metrics["duplicates_filtered"],
@@ -80,7 +72,6 @@ class ScraperService:
         print(f"🎨 Quality filtered: {stats['quality_filtered']}")
         print(f"⏱️  Time taken: {stats['total_time_seconds']:.2f} seconds")
         
-        # Print category breakdown
         category_counts = {}  
         for v in videos:
             cat = v.group_category.value

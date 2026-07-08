@@ -106,22 +106,10 @@ class YouTubeService:
         self.youtube = None
         
         # ============================================================
-        # QUOTA SETTINGS — CORRECTED TWO-BUCKET MODEL (verified July 2026)
+        # QUOTA SETTINGS — two-bucket model (search.list has its own
+        # 100-calls/day bucket, separate from the shared 10,000-unit
+        # pool used by videos.list etc.). Resets daily at midnight PT.
         # ============================================================
-        # Since the June 1, 2026 YouTube Data API change, search.list has
-        # its OWN separate quota bucket, capped at 100 CALLS/day, and each
-        # call costs 1 unit *within that bucket* — it no longer draws from
-        # the shared 10,000-unit/day pool used by videos.list, channels.list,
-        # etc. (Official source: the search.list reference page — "Quota
-        # impact: 100 calls per day. A call to this method has a quota cost
-        # of 1 unit in the Search Queries quota bucket.")
-        #
-        # videos.list (used to fetch stats/details) is also a flat 1 unit
-        # PER CALL regardless of how many video IDs or parts you request —
-        # NOT 1 unit per video ID. (Official quota table: videos.list = 1.)
-        #
-        # Both buckets reset at midnight Pacific Time daily — we track that
-        # explicitly below instead of only resetting on process restart.
         self.search_calls_used = 0
         self.search_calls_limit = 90     # real hard ceiling is 100/day; keep a small buffer
         self.quota_used = 0              # shared 10,000-unit pool (videos.list etc.)
@@ -146,12 +134,9 @@ class YouTubeService:
         # ============================================================
         # NEGATIVE QUERY — blocks romance/junk at the YouTube API level
         # ============================================================
-        # search.list's `q` param supports the boolean "-" (NOT) operator
-        # per-TERM (not per-phrase), so every token here is a single word.
-        # Appended to EVERY search below so YouTube itself excludes these
-        # before we ever spend a result slot on them (up to 50 results per
-        # call, so keeping junk out at the source matters more than
-        # filtering it out afterward).
+        # search.list's `q` param supports "-" (NOT) per single TERM, not
+        # per phrase, so every token here is one word. Applied to every
+        # search below, regardless of language.
         self.NEGATIVE_QUERY = (
             "-love -romance -romantic -boyfriend -girlfriend "
             "-kiss -kissing -lust -adult -18+ "
@@ -160,83 +145,89 @@ class YouTubeService:
         )
         
         # ============================================================
-        # QUOTA-OPTIMIZED, PRIORITY-TIERED SEARCH QUERIES
+        # SEARCH QUERIES — 6 FINAL CATEGORIES, PRIORITY-TIERED
         # ============================================================
-        # Each category is a LIST of (query, priority_weight, max_results)
-        # tuples instead of one giant query, because YouTube sorts by
-        # viewCount: OR-ing a 2.0-priority niche term (e.g. "Atha Kodalu
-        # Kathalu") together with a 1.7-priority generic term (e.g. "Telugu
-        # Learning Stories") in the SAME call lets the generic/high-view
-        # term dominate the top-50 results, drowning out the niche one.
-        # Splitting by priority tier gives every weight band its own
-        # dedicated call so nothing gets crowded out.
+        # "moral", "animation", and "stories" are now ONE merged category
+        # called "moral" (per request) — it absorbs the old animation
+        # search terms as an extra tier, and is the ONLY category where
+        # Hindi and Tamil content is allowed (2 dedicated tiers below,
+        # each with its own relevanceLanguage). Every other category
+        # (animals, birds, rhymes, cartoon, bedtime) stays Telugu-only.
         #
-        # 8 final classification buckets (see _determine_group): moral,
-        # animals, birds, rhymes, animation, cartoon, bedtime, stories
-        # (stories has no dedicated search — it's the fallback for videos
-        # that match generic terms in the "moral" tiers below but no
-        # moral/neethi/panchatantra-specific keyword).
+        # Each tuple = (query, priority_weight, max_results, language).
+        # Tiering by priority weight stops a low-weight generic term from
+        # drowning out a high-weight niche one when YouTube sorts by
+        # viewCount within a single OR'd call.
         #
-        # Total = 14 search.list calls per full run. At 2 scrapes/day
-        # that's 28 calls/day, well inside the real 100/day search-call
-        # ceiling (and the 90/day self-imposed buffer above).
+        # Total = 16 search.list calls/run → 32/day at 2 scrapes/day,
+        # still comfortably under the real 100-calls/day search bucket.
         # ============================================================
         
-        self.SEARCH_QUERIES: Dict[str, List[Tuple[str, float, int]]] = {
+        self.SEARCH_QUERIES: Dict[str, List[Tuple[str, float, int, str]]] = {
             "moral": [
+                # tier 1 (2.0) — Telugu: core moral + Atha Kodalu
                 ("Telugu Moral Stories|Moral Stories in Telugu|Neethi Kathalu Telugu|Neethi Katha Telugu|"
                  "Atha Kodalu|Atha Kodalu Stories|Atha vs Kodalu|Atha Kodalu Telugu|Atha Kodalu Kathalu|"
                  "Atta Kodalu Telugu|తెలుగు కథలు|నీతి కథలు|తెలుగు నీతి కథలు|పంచతంత్ర కథలు|అత్త కోడలు|అత్త కోడలు కథలు",
-                 2.0, 50),
+                 2.0, 50, "te"),
+                # tier 2 (1.9) — Telugu: general stories + panchatantra
                 ("Telugu Stories|Telugu Kathalu|Stories in Telugu|Panchatantra Telugu|Telugu Panchatantra Stories|"
                  "Kodalu Kathalu|Animated Telugu Moral Story|Animated Panchatantra Telugu",
-                 1.9, 50),
+                 1.9, 50, "te"),
+                # tier 3 (1.8) — Telugu: kids/educational framing
                 ("Kids Telugu Stories|Children Telugu Stories|Telugu Kids Stories|Educational Telugu Stories|"
                  "Telugu Story for Kids|Animated Telugu Stories",
-                 1.8, 40),
+                 1.8, 40, "te"),
+                # tier 4 (1.7) — Telugu: smaller long-tail
                 ("Telugu Learning Stories|Telugu Bedtime Moral Stories",
-                 1.7, 30),
+                 1.7, 30, "te"),
+                # tier 5 (1.9) — Telugu: animation, folded in from the old
+                # separate "animation" category (now merged into moral)
+                ("Telugu Animation Stories|Animation Stories Telugu|3D Animation Telugu Stories|Kids Animation Telugu",
+                 1.9, 40, "te"),
+                # tier 6 — HINDI (moral is the ONLY category allowing Hindi)
+                ("Moral Stories in Hindi|Hindi Moral Stories for Kids|Neeti Kahani Hindi|Panchatantra Kahaniyan|"
+                 "Akbar Birbal Kahani|Hindi Kahaniyan for Kids",
+                 1.8, 50, "hi"),
+                # tier 7 — TAMIL (moral is the ONLY category allowing Tamil)
+                ("Moral Stories in Tamil|Tamil Kathaigal|Panchatantra Kathaigal Tamil|Neethi Kathaigal Tamil|"
+                 "Tamil Moral Stories for Kids",
+                 1.8, 50, "ta"),
             ],
             "animals": [
                 ("Animal Stories Telugu|Animals Stories Telugu|Telugu Animal Stories|Animal Kathalu Telugu|"
                  "సింహం కథ|పులి కథ|ఏనుగు కథ|కోతి కథ|కుందేలు కథ|నక్క కథ|జింక కథ",
-                 2.0, 50),
+                 2.0, 50, "te"),
                 ("Wild Animal Stories Telugu|Jungle Stories Telugu|Lion Stories Telugu|Tiger Stories Telugu|"
                  "Elephant Stories Telugu|Monkey Stories Telugu|Rabbit Stories Telugu|Fox Stories Telugu|"
                  "Lion Kathalu Telugu|Tiger Kathalu Telugu|Monkey Kathalu Telugu|Elephant Kathalu Telugu",
-                 1.9, 50),
+                 1.9, 50, "te"),
                 ("Deer Stories Telugu|Dog Stories Telugu|Cat Stories Telugu|Bear Stories Telugu|Wolf Stories Telugu",
-                 1.8, 30),
+                 1.8, 30, "te"),
             ],
             "birds": [
                 ("Bird Stories Telugu|Birds Stories Telugu|Chilaka Stories|Chilaka Kathalu|Pichuka Stories|"
                  "Pichuka Kathalu|Pavuram Stories|Pavuram Kathalu|Kaki Stories|Kaki Kathalu|"
                  "చిలక కథలు|పిచుక కథలు|కాకి కథలు|పావురం కథలు",
-                 2.0, 50),
+                 2.0, 50, "te"),
                 ("Bird Cartoon Stories Telugu|Crow Stories Telugu|Parrot Stories Telugu",
-                 1.9, 30),
+                 1.9, 30, "te"),
             ],
             "rhymes": [
                 ("Telugu Nursery Rhymes|Nursery Rhymes Telugu|Telugu Nursery Rhymes for Kids|Telugu Rhymes|"
                  "Kids Rhymes Telugu|Telugu Kids Rhymes",
-                 1.9, 50),
+                 1.9, 50, "te"),
                 ("Telugu Kids Songs|Kids Songs Telugu|ABC Songs Telugu|Learning Songs Telugu",
-                 1.8, 30),
-            ],
-            "animation": [
-                ("Telugu Animation Stories|Animated Telugu Stories|Animated Telugu Moral Story|"
-                 "Animated Panchatantra Telugu|Animation Stories Telugu|3D Animation Telugu Stories|"
-                 "Kids Animation Telugu",
-                 1.9, 50),
+                 1.8, 30, "te"),
             ],
             "bedtime": [
                 ("Telugu Bedtime Stories|Kids Bedtime Stories Telugu|Telugu Fairy Tales|Sleep Stories Telugu|"
                  "Night Stories Telugu|Magical Stories Telugu|Bedtime Moral Stories Telugu",
-                 1.9, 40),
+                 1.9, 40, "te"),
             ],
             "cartoon": [
                 ("Telugu Cartoon Stories|Kids Cartoon Telugu|Cartoon Stories Telugu|Telugu Kids Cartoon Story",
-                 1.9, 40),
+                 1.9, 40, "te"),
             ],
         }
         
@@ -258,6 +249,14 @@ class YouTubeService:
             "animal", "animals", "jungle", "lion", "tiger", "elephant",
             "monkey", "rabbit", "fox", "deer", "dog", "cat", "bear", "wolf",
             
+            # Hindi / Tamil story-words — safety net so moral-category
+            # Hindi/Tamil videos with no English words still pass the
+            # whitelist (they're only ALLOWED THROUGH later if
+            # _determine_group also classifies them as "moral")
+            "kahani", "kahaniyan", "kathai", "kathaigal",
+            "कहानी", "कहानियां", "नैतिक",
+            "கதை", "கதைகள்", "நீதி",
+            
             # Telugu script
             "కథ", "కథలు", "నీతి", "పిల్లల", "పక్షి",
             "సింహం", "పులి", "ఏనుగు", "కోతి", "కుందేలు", "నక్క", "జింక",
@@ -274,18 +273,18 @@ class YouTubeService:
             "live", "streaming", "podcast", "behind the scenes",
 
             # ============================================================
-            # MUSIC/FILM JUNK — needed now that YouTube category 10 (Music)
-            # is allowed (see ALLOWED_CATEGORIES below), so real kids'
-            # rhymes/songs get in without opening the door to movie songs
+            # MUSIC/FILM JUNK — needed because YouTube category 10 (Music)
+            # is allowed, so real kids' rhymes/songs get in without
+            # opening the door to movie songs
             # ============================================================
             "item song", "music video", "audio song", "video song",
             "lyrical video", "full video song", "album", "jukebox",
             "audio jukebox", "dj songs", "remix",
 
             # ============================================================
-            # ROMANCE / LOVE — backstop behind NEGATIVE_QUERY above (in
-            # case a video slips through the API-level exclusion, e.g. the
-            # term only appears in the description, not the title)
+            # ROMANCE / LOVE — backstop behind NEGATIVE_QUERY above.
+            # Blocked everywhere, INCLUDING moral — the Hindi/Tamil
+            # exception below is about LANGUAGE, not about content type.
             # ============================================================
             "love", "love story", "love stories", "romance", "romantic",
             "boyfriend", "girlfriend", "crush", "proposal", "kiss", "kissing",
@@ -293,26 +292,35 @@ class YouTubeService:
             "ప్రేమ", "ప్రేమ కథ", "లవ్", "రోమాన్స్", "ముద్దు", "సెక్స్", "వ్యభిచారం",
 
             # ============================================================
-            # OTHER STRICT NEGATIVES FROM ORIGINAL SPEC (previously missing)
+            # OTHER STRICT NEGATIVES (block everywhere, any category)
             # ============================================================
             "astrology", "health tips", "beauty tips", "makeup",
             "recipe", "cooking", "travel vlog", "comedy show", "standup",
             "memes", "status", "viral", "challenge", "experiment",
             "wedding", "festival vlog", "horror", "ghost", "devotional",
             "crime", "murder", "dance", "shorts",
-            
-            # ============================================================
-            # HINDI LANGUAGE BLOCKERS
-            # ============================================================
-            "hindi", "हिंदी", "हिन्दी",  # Hindi in English and Devanagari
-            "hindi story", "hindi stories", "hindi kahani",
-            "hindi rhymes", "hindi cartoon", "hindi animation",
-            "akbar birbal", "birbal", "अकबर", "बीरबल",
-            "panchtantra stories", "panchatantra hindi",
-            "moral stories in hindi", "hindi moral",
-            "hindi nursery rhymes", "hindi kids",
-            "bal kahani", "bachon ki kahaniyan",
-            "hindi me", "hindi mai",  # "in Hindi"
+        ]
+        
+        # ============================================================
+        # LANGUAGE GATE — Telugu-only EVERYWHERE EXCEPT "moral"
+        # ============================================================
+        # "moral" (now merged with animation + stories) is explicitly
+        # allowed to include Hindi and Tamil content too. Every other
+        # category must stay Telugu-only, so these terms are only
+        # checked in process_video_item when group != "moral". Terms
+        # that specifically describe HINDI MORAL content (e.g. "akbar
+        # birbal", "panchatantra hindi") are deliberately NOT here,
+        # since that's exactly the content the moral category now wants.
+        # ============================================================
+        self.NON_MORAL_LANGUAGE_BLOCKERS = [
+            "hindi", "हिंदी", "हिन्दी", "hindi me", "hindi mai",
+            "hindi rhymes", "hindi cartoon", "hindi animation", "hindi nursery rhymes",
+            "hindi kids", "hindi bird", "hindi birds", "hindi animal", "hindi animals",
+            "hindi bedtime",
+            "tamil", "தமிழ்",
+            "tamil rhymes", "tamil cartoon", "tamil animation", "tamil nursery rhymes",
+            "tamil kids", "tamil bird", "tamil birds", "tamil animal", "tamil animals",
+            "tamil bedtime",
         ]
         
         # Channel blacklist (low-quality sources)
@@ -322,17 +330,13 @@ class YouTubeService:
         }
         
         # ============================================================
-        # ALLOWED CATEGORIES
+        # ALLOWED CATEGORIES (YouTube's own content categories)
         # ============================================================
         
         self.ALLOWED_CATEGORIES = {
             "1",   # Film & Animation
-            "10",  # Music — many Nursery Rhymes / Kids Songs channels file
-                   # here instead of Education, so excluding it was silently
-                   # killing recall for the "rhymes" bucket specifically.
-                   # Safe to allow because MUST_NOT_CONTAIN above now blocks
-                   # item songs / music videos / albums / jukeboxes.
-            "15",  # Pets & Animals — relevant now for the "animals" bucket too
+            "10",  # Music — Nursery Rhymes / Kids Songs channels often file here
+            "15",  # Pets & Animals — relevant for the "animals" bucket
             "22",  # People & Blogs
             "23",  # Comedy
             "24",  # Entertainment
@@ -371,7 +375,7 @@ class YouTubeService:
         """Backward compatibility - flatten all search queries (all tiers)"""
         keywords = []
         for query_list in self.SEARCH_QUERIES.values():
-            for query, _, _ in query_list:
+            for query, _, _, _ in query_list:
                 keywords.append(query)
         return keywords
     
@@ -380,12 +384,6 @@ class YouTubeService:
     # ============================================================
     
     async def _maybe_reset_daily_quota(self):
-        """YouTube resets both quota buckets at midnight Pacific Time.
-        The service instance lives for the lifetime of the app process
-        (created once in ScraperService.__init__), so without this check
-        quota_used/search_calls_used would just accumulate forever and
-        eventually self-throttle every run even though YouTube's real
-        quota had long since reset."""
         today = datetime.now(PACIFIC).date()
         if today != self._quota_reset_date:
             print(f"🔄 New day in Pacific Time ({today}) — resetting quota counters")
@@ -462,12 +460,13 @@ class YouTubeService:
         return f"{seconds}s", total
     
     # ============================================================
-    # GROUP DETERMINATION (maps every sub-keyword to 1 of 8 final buckets)
+    # GROUP DETERMINATION — 6 final buckets. "moral" is the merged
+    # moral + animation + stories catch-all (lowest priority = default).
     # ============================================================
     
     def _determine_group(self, title: str, channel: str) -> str:
-        """Categorize with priority scoring into exactly one of:
-        birds, animals, rhymes, cartoon, animation, bedtime, moral, stories
+        """Categorize into exactly one of:
+        birds, animals, rhymes, cartoon, bedtime, moral
         """
         combined = f"{title.lower()} {channel.lower()}"
         
@@ -476,7 +475,7 @@ class YouTubeService:
                 r"\bbird\b", r"\bbirds\b",
                 r"\bchilaka\b", r"\bpichuka\b", r"\bpavuram\b", r"\bkaki\b",
                 "chilaka kathalu", "birds stories", "bird stories",
-            ], 100),
+            ], 90),
             
             "animals": ([
                 r"\banimal\b", r"\banimals\b", r"\bjungle\b", "wild animal",
@@ -491,37 +490,37 @@ class YouTubeService:
                 r"\bsong\b", r"\bsongs\b", r"\blullaby\b",
                 "nursery rhymes", "kids rhymes", "learning song", "learning songs",
                 "abc rhymes", "abc songs", "alphabet song",
-            ], 90),
+            ], 80),
             
             "cartoon": ([
                 r"\bcartoon\b", r"\bcartoons\b",
                 "animated cartoon", "telugu cartoon",
-            ], 80),
-            
-            "animation": ([
-                r"\banimation\b",
-                "animated story", "animation story",
-            ], 70),
+            ], 85),
             
             "bedtime": ([
                 r"\bbedtime\b", "sleep story", "night story",
-                r"\bfairy\s*tale", "fairy tales", "fairytale",
+        
             ], 60),
             
+            # MERGED: moral + animation + stories, now the lowest-priority
+            # catch-all (was "stories" before). Also matches Hindi/Tamil
+            # story-words since this is the one category that allows them.
             "moral": ([
-                r"\bmoral\b", r"\bneethi\b", r"\bneeti\b",
+                r"\bmoral\b","telugu moral stories" r"\bneethi\b", r"\bneeti\b",
                 r"\bpanchatantra\b", "atha kodalu", "neethi kathalu",
-            ], 50),
-            
-            "stories": ([
+                r"\banimation\b", "animated story", "animation story",
                 r"\bstory\b", r"\bstories\b",
                 r"\bkatha\b", r"\bkathalu\b",
                 "kids story", "telugu stories",
+                r"\bfairy\s*tale", "fairy tales", "fairytale",
                 r"\beducational\b", "educational story", "educational stories",
-            ], 10),
+                "kahani", "kahaniyan", "kathai", "kathaigal",
+                "birbal", "akbar birbal", "panchatantra hindi",
+                "बीरबल", "अकबर", "पंचतंत्र", "नैतिक", "कहानी",
+            ], 100),
         }
         
-        best_category = "stories"
+        best_category = "moral"  # default/fallback, since moral absorbed "stories"
         best_score = -1
         
         for category, (patterns, priority) in categories.items():
@@ -545,9 +544,12 @@ class YouTubeService:
         published_after: str,
         priority: float = 1.0,
         max_results: int = 50,
+        language: str = "te",
     ) -> List[str]:
         """Run one quota-efficient OR-combined search for one priority tier
         of a final category, with romance/junk excluded at the API level.
+        `language` sets relevanceLanguage — "te" for every category except
+        moral's dedicated Hindi ("hi") and Tamil ("ta") tiers.
         """
         
         if not await self.check_search_quota():
@@ -569,7 +571,7 @@ class YouTubeService:
                     regionCode="IN",
                     maxResults=max_results,
                     order="viewCount",
-                    relevanceLanguage="te",
+                    relevanceLanguage=language,
                     safeSearch="strict",
                     publishedAfter=published_after,
                     videoDuration="medium",
@@ -593,7 +595,7 @@ class YouTubeService:
             self.metrics["total_videos_found"] += len(ids)
             self.metrics["duplicates_filtered"] += (len(ids) - len(new_ids))
             
-            print(f"✓ [{category}] priority={priority} → {len(new_ids)}/{len(ids)} new "
+            print(f"✓ [{category}/{language}] priority={priority} → {len(new_ids)}/{len(ids)} new "
                   f"(search calls: {self.search_calls_used}/{self.search_calls_limit} today)")
             
         except HttpError as e:
@@ -606,15 +608,14 @@ class YouTubeService:
     async def search_all_keywords(self, published_after: str) -> List[str]:
         """Search using priority-tiered OR-combined queries per category.
 
-        14 calls total per run (2 scrapes/day = 28/day) vs. the real
-        100-calls/day search bucket ceiling — comfortable headroom while
-        covering far more sub-keywords than a single query per category.
+        16 calls total per run (2 scrapes/day = 32/day) vs. the real
+        100-calls/day search bucket ceiling.
         """
         all_video_ids = []
         
         for category, query_list in self.SEARCH_QUERIES.items():
-            for tier_idx, (query, priority, max_results) in enumerate(query_list, 1):
-                video_ids = await self.search_keyword(category, query, published_after, priority, max_results)
+            for tier_idx, (query, priority, max_results, language) in enumerate(query_list, 1):
+                video_ids = await self.search_keyword(category, query, published_after, priority, max_results, language)
                 all_video_ids.extend(video_ids)
                 await asyncio.sleep(0.2)
         
@@ -652,9 +653,7 @@ class YouTubeService:
                     print(f"    ⚠️ Error processing item: {e}")
                     continue
             
-            # videos.list costs a flat 1 unit PER CALL, regardless of how
-            # many IDs are in the batch (up to 50) or how many `part`
-            # values are requested — NOT 1 unit per video ID.
+            # videos.list costs a flat 1 unit PER CALL, regardless of batch size
             await self.check_quota(1)
             
         except HttpError as e:
@@ -688,6 +687,7 @@ class YouTubeService:
             self.metrics["quality_filtered"] += 1
             return None
         
+        # Universal negatives — block everywhere, any category, any language
         if any(bad in title_lower for bad in self.MUST_NOT_CONTAIN):
             self.metrics["quality_filtered"] += 1
             return None
@@ -695,7 +695,15 @@ class YouTubeService:
         raw_dur = content.get("duration", "PT0S")
         duration_text, duration_sec = self._parse_duration(raw_dur)
         
+        # Determine topic FIRST (language-independent) so the language
+        # gate below can be conditional on the result.
         group = self._determine_group(title, channel)
+        
+        # LANGUAGE GATE: Telugu-only for every category except "moral"
+        if group != "moral":
+            if any(bad in title_lower for bad in self.NON_MORAL_LANGUAGE_BLOCKERS):
+                self.metrics["quality_filtered"] += 1
+                return None
 
         # Duration limits
         if group == "rhymes":
@@ -728,16 +736,13 @@ class YouTubeService:
         # TIMEZONE HANDLING - FIXED
         # ============================================================
         
-        # Step 1: Parse YouTube published time (UTC)
         published_str = snippet.get("publishedAt", "")
         published_at = datetime.strptime(published_str, "%Y-%m-%dT%H:%M:%SZ")
         published_at_utc = published_at.replace(tzinfo=timezone.utc)
         
-        # Step 2: Calculate hours_ago using UTC (for display purposes)
         now_utc = datetime.now(timezone.utc)
         hours_ago = int((now_utc - published_at_utc).total_seconds() / 3600)
         
-        # Step 3: Strip timezone for database storage (since DB uses TIMESTAMP WITHOUT TIME ZONE)
         published_at_naive = published_at_utc.replace(tzinfo=None)
         
         # ============================================================
@@ -807,7 +812,7 @@ class YouTubeService:
         
         grouped = defaultdict(list)
         for video in videos:
-            category = video.get("group_category", "stories")
+            category = video.get("group_category", "moral")
             grouped[category].append(video)
         
         for category in grouped:
@@ -832,7 +837,6 @@ class YouTubeService:
             "grouped_videos": dict(grouped),
             "summary": summary,
             "metadata": {
-                # Keep database metadata in UTC (as string)
                 "fetch_timestamp": datetime.now(timezone.utc).isoformat(),
                 "search_calls_used": self.search_calls_used,
                 "search_calls_limit": self.search_calls_limit,
@@ -869,7 +873,6 @@ class YouTubeService:
     async def fetch_all_videos(self) -> Dict[str, Any]:
         """Main method to fetch all videos with all improvements"""
         
-        # Update metrics start time to IST
         self.metrics["start_time"] = datetime.now(IST)
         
         print("🚀 Starting YouTube video fetch...")
@@ -885,7 +888,6 @@ class YouTubeService:
         print("\n📥 Fetching video details...")
         videos = await self.get_video_details(video_ids)
         
-        # Update elapsed calculation with IST
         elapsed = (
             datetime.now(IST) - self.metrics["start_time"]
         ).total_seconds()

@@ -6,12 +6,10 @@ from enum import Enum
 
 class VideoCategoryEnum(str, Enum):
     RHYMES = "rhymes"
-    STORIES = "stories"
     CARTOON = "cartoon"
-    ANIMATION = "animation"
     BIRDS = "birds"
     BEDTIME = "bedtime"
-    MORAL = "moral"
+    MORAL = "moral"      # merged: moral + animation + stories
     ANIMALS = "animals"
 
 

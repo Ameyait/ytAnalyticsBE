@@ -170,7 +170,7 @@ async def get_videos(
     db: AsyncSession = Depends(get_db)
 ):
     # Validate category
-    allowed_categories = ["rhymes", "stories", "cartoon", "animation", "birds", "bedtime", "moral", "animals"]
+    allowed_categories = ["moral", "animals", "rhymes", "bedtime", "cartoon", "birds"]
     if category and category not in allowed_categories:
         raise HTTPException(
             status_code=400, 
@@ -281,7 +281,7 @@ async def root():
     return {
         "api": "YouTube Telugu Kids Content API",
         "version": "1.0.0",
-        "categories": ["rhymes", "stories", "cartoon", "animation", "birds", "bedtime", "moral", "animals"],
+        "categories": ["moral", "animals", "rhymes", "bedtime", "cartoon", "birds"],
         "endpoints": {
             "GET /videos": "Get videos with category filter (includes channel URL and last refreshed date)",
             "GET /animations": "Get only animation videos",
