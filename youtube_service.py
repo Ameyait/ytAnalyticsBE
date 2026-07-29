@@ -212,7 +212,7 @@ class YouTubeService:
                  2.0, 50, "te"),
                 ("Bird Cartoon Stories Telugu|Crow Stories Telugu|Parrot Stories Telugu",
                  1.9, 30, "te"),
-            ],
+            ], 
             "rhymes": [
                 ("Telugu Nursery Rhymes|Nursery Rhymes Telugu|Telugu Nursery Rhymes for Kids|Telugu Rhymes|"
                  "Kids Rhymes Telugu|Telugu Kids Rhymes",
@@ -506,18 +506,76 @@ class YouTubeService:
             # catch-all (was "stories" before). Also matches Hindi/Tamil
             # story-words since this is the one category that allows them.
             "moral": ([
-                r"\bmoral\b","telugu moral stories" r"\bneethi\b", r"\bneeti\b",
-                r"\bpanchatantra\b", "atha kodalu", "neethi kathalu",
-                r"\banimation\b", "animated story", "animation story",
-                r"\bstory\b", r"\bstories\b",
-                r"\bkatha\b", r"\bkathalu\b",
-                "kids story", "telugu stories",
-                r"\bfairy\s*tale", "fairy tales", "fairytale",
-                r"\beducational\b", "educational story", "educational stories",
-                "kahani", "kahaniyan", "kathai", "kathaigal",
-                "birbal", "akbar birbal", "panchatantra hindi",
-                "बीरबल", "अकबर", "पंचतंत्र", "नैतिक", "कहानी",
-            ], 100),
+    r"\bmoral\b",
+    "telugu moral stories",
+    r"\bneethi\b",
+    r"\bneeti\b",
+    r"\bpanchatantra\b",
+
+    # Existing
+    "atha kodalu",
+    "athavskodalu",
+    "thodikodallu",
+    "neethi kathalu",
+    "athakodalukathalu",
+
+    # ===== NEW Atha Kodalu Variations =====
+    "atha kodalu telugu stories",
+    "atha kodalu moral stories",
+    "atha kodalu kathalu",
+    "atha vs kodalu",
+    "atha vs kodalu telugu",
+    "telugu atha kodalu stories",
+    "telugu moral stories atha kodalu",
+    "atha kodalu stories",
+    "atta kodalu",
+    "atta kodalu kathalu",
+    "atta vs kodalu",
+    "kodalu kathalu",
+    "family moral stories",
+    "family stories",
+    "village stories",
+    "palletoori kathalu",
+    "telugu fairy tales",
+
+    # Existing
+    r"\banimation\b",
+    "animated story",
+    "animation story",
+
+    r"\bstory\b",
+    r"\bstories\b",
+
+    r"\bkatha\b",
+    r"\bkathalu\b",
+
+    "kids story",
+    "telugustories",
+
+    r"\bfairy\s*tale",
+    "fairy tales",
+    "fairytale",
+
+    r"\beducational\b",
+    "educational story",
+    "educational stories",
+
+    # Hindi
+    "kahani",
+    "kahaniyan",
+    "kathai",
+    "kathaigal",
+
+    "birbal",
+    "akbar birbal",
+    "panchatantra hindi",
+
+    "बीरबल",
+    "अकबर",
+    "पंचतंत्र",
+    "नैतिक",
+    "कहानी",
+], 100),
         }
         
         best_category = "moral"  # default/fallback, since moral absorbed "stories"
@@ -563,21 +621,23 @@ class YouTubeService:
             loop = asyncio.get_event_loop()
             
             response = await loop.run_in_executor(
-                None,
-                lambda: youtube.search().list(
-                    part="snippet",
-                    q=full_query,
-                    type="video",
-                    regionCode="IN",
-                    maxResults=max_results,
-                    order="viewCount",
-                    relevanceLanguage=language,
-                    safeSearch="strict",
-                    publishedAfter=published_after,
-                    videoDuration="medium",
-                ).execute()
-            )
-            
+            None,
+            lambda: youtube.search().list(
+                part="snippet",
+                q=full_query,
+                type="video",
+                regionCode="IN",
+                maxResults=max_results,
+                order="viewCount",
+                relevanceLanguage=language,
+                safeSearch="strict",
+                publishedAfter=published_after,
+                # videoDuration removed — was capping results to 4–20 min,
+                # silently dropping anything longer (like this 28:55 video)
+                # before your own duration_sec filter ever saw it
+            ).execute()
+        )
+                    
             ids = [
                 item["id"]["videoId"]
                 for item in response.get("items", [])

@@ -239,7 +239,7 @@ async def trigger_scrape(background_tasks: BackgroundTasks, db: AsyncSession = D
             try:
                 videos, stats = await scraper_service.scrape_all_videos()
                 saved_videos = await VideoCRUD.bulk_create_or_update(new_session, videos)
-                deleted_count = await VideoCRUD.delete_old_videos(new_session, days=3)
+                deleted_count = await VideoCRUD.delete_old_videos(new_session, days=4)
                 
                 result = await new_session.execute(
                     select(ScrapeLogModel).where(ScrapeLogModel.id == scrape_log.id)

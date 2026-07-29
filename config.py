@@ -33,7 +33,7 @@ class Config:
     # Application Settings
     # ============================================================
     MAX_PER_KEYWORD = int(os.getenv("MAX_PER_KEYWORD", 20))
-    DAYS_BACK = int(os.getenv("DAYS_BACK", 3))
+    DAYS_BACK = int(os.getenv("DAYS_BACK", 4))
     MIN_DURATION_SECONDS = int(os.getenv("MIN_DURATION_SECONDS", 190))
     REGION_CODE = os.getenv("REGION_CODE", "IN")
 
